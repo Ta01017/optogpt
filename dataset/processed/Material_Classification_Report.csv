@@ -1,0 +1,23 @@
+Material,Category,Avg_n,Avg_k,Path
+Ge,Absorber / Lossy,4.5957,0.14646,.\Ge.csv
+GaSb,Absorber / Lossy,4.0651,0.16811,.\GaSb.csv
+ITO,Absorber / Lossy,0.5821,0.69269,.\ITO.csv
+ZnSe,High Index (2.0-3.0),2.4102,0.02419,.\ZnSe.csv
+ZnS,High Index (2.0-3.0),2.2862,1e-05,.\ZnS.csv
+Nb2O5,High Index (2.0-3.0),2.245,0.0,.\Nb2O5.csv
+AlN,High Index (2.0-3.0),2.125,0.0,.\AlN.csv
+Ta2O5,High Index (2.0-3.0),2.091,0.0,.\Ta2O5.csv
+TiO2,High Index (2.0-3.0),2.0644,0.0,.\TiO2.csv
+HfO2,High Index (2.0-3.0),2.0586,0.0,.\HfO2.csv
+ZnO,Low Index (<1.6),1.5745,0.00205,.\ZnO.csv
+SiO2,Low Index (<1.6),1.4664,0.0,.\SiO2.csv
+MgF2,Low Index (<1.6),1.4176,0.00027,.\MgF2.csv
+Si3N4,Medium Index (1.6-2.0),1.963,0.0,.\Si3N4.csv
+MgO,Medium Index (1.6-2.0),1.6961,0.0,.\MgO.csv
+TiN,Metal (Reflective),2.5513,4.39388,.\TiN.csv
+Al2O3,Metal (Reflective),1.3265,11.54337,.\Al2O3.csv
+Al,Metal (Reflective),1.2014,11.63079,.\Al.csv
+Au,Metal (Reflective),0.1818,9.2785,.\Au.csv
+Ag,Metal (Reflective),0.1207,9.59894,.\Ag.csv
+a-Si,Ultra-High Index (>3.0),3.5418,0.00108,.\a-Si.csv
+Si,Ultra-High Index (>3.0),3.4699,0.0,.\Si.csv

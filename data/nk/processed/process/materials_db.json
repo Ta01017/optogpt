@@ -1,0 +1,156 @@
+[
+    {
+        "name": "MgF2",
+        "category": "LOW_INDEX",
+        "avg_n": 1.4176,
+        "avg_k": 0.00027,
+        "file_path": "./MgF2.csv"
+    },
+    {
+        "name": "SiO2",
+        "category": "LOW_INDEX",
+        "avg_n": 1.4664,
+        "avg_k": 0.0,
+        "file_path": "./SiO2.csv"
+    },
+    {
+        "name": "ZnO",
+        "category": "LOW_INDEX",
+        "avg_n": 1.5745,
+        "avg_k": 0.00205,
+        "file_path": "./ZnO.csv"
+    },
+    {
+        "name": "MgO",
+        "category": "MEDIUM_INDEX",
+        "avg_n": 1.6961,
+        "avg_k": 0.0,
+        "file_path": "./MgO.csv"
+    },
+    {
+        "name": "Si3N4",
+        "category": "MEDIUM_INDEX",
+        "avg_n": 1.963,
+        "avg_k": 0.0,
+        "file_path": "./Si3N4.csv"
+    },
+    {
+        "name": "HfO2",
+        "category": "HIGH_INDEX",
+        "avg_n": 2.0586,
+        "avg_k": 0.0,
+        "file_path": "./HfO2.csv"
+    },
+    {
+        "name": "TiO2",
+        "category": "HIGH_INDEX",
+        "avg_n": 2.0644,
+        "avg_k": 0.0,
+        "file_path": "./TiO2.csv"
+    },
+    {
+        "name": "Ta2O5",
+        "category": "HIGH_INDEX",
+        "avg_n": 2.091,
+        "avg_k": 0.0,
+        "file_path": "./Ta2O5.csv"
+    },
+    {
+        "name": "AlN",
+        "category": "HIGH_INDEX",
+        "avg_n": 2.125,
+        "avg_k": 0.0,
+        "file_path": "./AlN.csv"
+    },
+    {
+        "name": "Nb2O5",
+        "category": "HIGH_INDEX",
+        "avg_n": 2.245,
+        "avg_k": 0.0,
+        "file_path": "./Nb2O5.csv"
+    },
+    {
+        "name": "ZnS",
+        "category": "HIGH_INDEX",
+        "avg_n": 2.2862,
+        "avg_k": 1e-05,
+        "file_path": "./ZnS.csv"
+    },
+    {
+        "name": "ZnSe",
+        "category": "HIGH_INDEX",
+        "avg_n": 2.4102,
+        "avg_k": 0.02419,
+        "file_path": "./ZnSe.csv"
+    },
+    {
+        "name": "Si",
+        "category": "ULTRA_HIGH_INDEX",
+        "avg_n": 3.4699,
+        "avg_k": 0.0,
+        "file_path": "./Si.csv"
+    },
+    {
+        "name": "a-Si",
+        "category": "ULTRA_HIGH_INDEX",
+        "avg_n": 3.5418,
+        "avg_k": 0.00108,
+        "file_path": "./a-Si.csv"
+    },
+    {
+        "name": "ITO",
+        "category": "ABSORBER_LOSSY",
+        "avg_n": 0.5821,
+        "avg_k": 0.69269,
+        "file_path": "./ITO.csv"
+    },
+    {
+        "name": "GaSb",
+        "category": "ABSORBER_LOSSY",
+        "avg_n": 4.0651,
+        "avg_k": 0.16811,
+        "file_path": "./GaSb.csv"
+    },
+    {
+        "name": "Ge",
+        "category": "ABSORBER_LOSSY",
+        "avg_n": 4.5957,
+        "avg_k": 0.14646,
+        "file_path": "./Ge.csv"
+    },
+    {
+        "name": "Ag",
+        "category": "METAL",
+        "avg_n": 0.1207,
+        "avg_k": 9.59894,
+        "file_path": "./Ag.csv"
+    },
+    {
+        "name": "Au",
+        "category": "METAL",
+        "avg_n": 0.1818,
+        "avg_k": 9.2785,
+        "file_path": "./Au.csv"
+    },
+    {
+        "name": "Al",
+        "category": "METAL",
+        "avg_n": 1.2014,
+        "avg_k": 11.63079,
+        "file_path": "./Al.csv"
+    },
+    {
+        "name": "Al2O3",
+        "category": "METAL",
+        "avg_n": 1.3265,
+        "avg_k": 11.54337,
+        "file_path": "./Al2O3.csv"
+    },
+    {
+        "name": "TiN",
+        "category": "METAL",
+        "avg_n": 2.5513,
+        "avg_k": 4.39388,
+        "file_path": "./TiN.csv"
+    }
+]
