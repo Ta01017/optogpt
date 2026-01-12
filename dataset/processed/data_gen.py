@@ -1025,8 +1025,9 @@ NUM_SAMPLES = 6000
 PAIR_MIN = 6
 PAIR_MAX = 10
 
-WAVELENGTHS = np.arange(0.8, 1.7, 0.005)  # um
-LAMBDA0_RANGE = (0.9, 1.5)                # um
+WAVELENGTHS = np.linspace(0.9, 1.7, int(round((1.7 - 0.9) / 0.005)) + 1)  # um  # um
+
+LAMBDA0_RANGE = (0.9, 1.7)                # um
 
 PERTURB_STD = 0.01
 PERTURB_RANDOM = 0.10
@@ -1251,7 +1252,8 @@ def calc_RT(materials, thicknesses, nk_dict, pol='s', theta_deg=0.0):
     R, T = [], []
     d_list = [np.inf] + thicknesses + [np.inf]
     th0 = np.deg2rad(theta_deg)
-    wl_nm_list = (WAVELENGTHS * 1000).astype(int)
+    # wl_nm_list = (WAVELENGTHS * 1000).astype(int)
+    wl_nm_list = np.round(WAVELENGTHS * 1000).astype(int)
 
     for i, wl_nm in enumerate(wl_nm_list):
         n_list = [1] + [nk_dict[m][i] for m in materials] + [1]
@@ -1302,7 +1304,7 @@ def check_dbr_structure(materials, thicknesses, nk_dict, lambda0_um, expected_pa
 # 光谱行为检查（慢）
 # =========================
 def check_dbr_spectrum(R, lambda0_um, peak_min=PEAK_MIN, band_threshold=BAND_THRESHOLD, band_min_width_nm=BAND_MIN_WIDTH_NM):
-    wl_nm = (WAVELENGTHS * 1000).astype(float)
+    wl_nm = np.round(WAVELENGTHS * 1000).astype(int)
     lambda0_nm = lambda0_um * 1000.0
     R = np.asarray(R, dtype=np.float32)
 
@@ -1457,7 +1459,7 @@ def generate_dataset():
             plt.show()
             print("structure_ok:", ok_s, info_s, "spec_ok:", ok_r, info_r)
 
-    wl_nm_list = (WAVELENGTHS * 1000).astype(int)
+    wl_nm_list = np.round(WAVELENGTHS * 1000).astype(int)
     records = []
     dropped = 0
     tried = 0

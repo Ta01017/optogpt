@@ -1,424 +1,330 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-eval_dbr.py
-- 支持 spec_type: "R", "T", "R_T"/"R+T"
-- 两个改动已集成：
-  1) min_len_layers 前禁止生成 EOS（避免 layers=0 collapse）
-  2) 简单 DBR grammar（奇数层从 Hset 选，偶数层从 Lset 选；只允许 Mat_thick token）
-
-运行：python eval_dbr.py
-（参数都写在 main_config() 里，不用命令行）
-"""
+# eval_dbr_mae.py
+# DBR eval (MAE) aligned with your dataset generation:
+# - WAVELENGTHS: np.linspace(0.9, 1.7, int(round((1.7-0.9)/0.005))+1)
+# - wl_nm: np.round(WAVELENGTHS*1000).astype(int)
+# - forward: coh_tmm, air / layers / air
+# - structure token: "Mat_123" saved with int(round(thickness_nm))
+# - spectrum target: [R..., T...] (len = 2*len(WAVELENGTHS)) saved in Spectrum_dev.pkl
 
 import os
 import re
-import copy
-import math
-import random
+import argparse
 import pickle as pkl
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Set
+from typing import List, Dict, Tuple, Any
 
 import numpy as np
-import pandas as pd
 import torch
-import matplotlib.pyplot as plt
+
+import pandas as pd
 from scipy.interpolate import interp1d
 from tmm import coh_tmm
 
-# ====== 你的工程 import（按你现有结构）======
-from core.datasets.datasets import PrepareData, Batch, PAD
-from core.models.transformer import make_model_I
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-# -----------------------------
-# 0) 配置（你不想写命令行就写这里）
-# -----------------------------
-@dataclass
-class Cfg:
-    ckpt: str = "saved_models/optogpt/test/model_inverse_R_best.pt"
-
-    train_struc: str = "./output/train_structure.pkl"
-    train_spec: str  = "./output/train_spectrum.pkl"
-    dev_struc: str   = "./output/dev_structure.pkl"
-    dev_spec: str    = "./output/dev_spectrum.pkl"
-
-    nk_dir: str = "./data/nk/processed"
-
-    spec_type: str = "R_T"   # "R" / "T" / "R_T" / "R+T"
-    num_eval: int = 50
-
-    # 你的数据生成器波段（必须一致）
-    lam_low: float = 0.8
-    lam_high: float = 1.7
-    lam_step: float = 0.005
-
-    # decode 超参
-    max_len_layers: int = 22
-    min_len_layers: int = 4
-    temperature: float = 1.0
-
-    # 模型结构（必须和训练一致）
-    N: int = 2
-    d_model: int = 256
-    d_ff: int = 1024
-    h: int = 8
-    dropout: float = 0.1
-
-    # 语法分组参数（按 n 中位数分H/L）
-    dn_th: float = 0.15
-    k_max_th: float = 1e-3
-
-    # 保存图像
-    save_fig: bool = True
-    fig_dir: str = "./eval_figs"
+# ===== your project import =====
+from core.models.transformer import make_model_I
 
 
-def main_config() -> Cfg:
-    cfg = Cfg()
-    os.makedirs(cfg.fig_dir, exist_ok=True)
-    return cfg
+# =========================
+# 0) wavelengths (must match your generator)
+# =========================
+WAVELENGTHS = np.linspace(0.9, 1.7, int(round((1.7 - 0.9) / 0.005)) + 1).astype(np.float64)  # um
+WL_NM = np.round(WAVELENGTHS * 1000).astype(int)  # nm
+SPEC_DIM_EXPECT = 2 * len(WAVELENGTHS)  # 322
 
 
-# -----------------------------
-# 1) nk 读取（csv: wl,n,k）
-# -----------------------------
-def load_nk(materials: List[str], wavelengths: np.ndarray, nk_dir: str) -> Dict[str, np.ndarray]:
+# =========================
+# 1) utils: io
+# =========================
+def load_pickle(path: str):
+    with open(path, "rb") as f:
+        return pkl.load(f)
+
+
+def load_dev_data(dataset_dir: str) -> Tuple[List[List[str]], np.ndarray]:
+    struct_path = os.path.join(dataset_dir, "Structure_dev.pkl")
+    spec_path = os.path.join(dataset_dir, "Spectrum_dev.pkl")
+
+    if not os.path.exists(struct_path):
+        raise FileNotFoundError(f"Missing: {struct_path}")
+    if not os.path.exists(spec_path):
+        raise FileNotFoundError(f"Missing: {spec_path}")
+
+    structures = load_pickle(struct_path)  # list[list[str]]
+    spectra = np.array(load_pickle(spec_path), dtype=np.float32)  # (N, 2W)
+
+    if spectra.ndim != 2:
+        raise ValueError(f"Spectrum_dev should be 2D array-like, got shape {spectra.shape}")
+    if spectra.shape[1] != SPEC_DIM_EXPECT:
+        raise ValueError(
+            f"Spectrum dim mismatch: got {spectra.shape[1]}, expect {SPEC_DIM_EXPECT} "
+            f"(0.9–1.7 um, step=0.005, R+T)."
+        )
+    if len(structures) != spectra.shape[0]:
+        raise ValueError(f"Size mismatch: len(structure)={len(structures)} vs spectra={spectra.shape[0]}")
+    return structures, spectra
+
+
+# =========================
+# 2) nk loader (csv: wl(um), n, k)
+# =========================
+def load_nk(materials: List[str], nk_dir: str, wavelengths_um: np.ndarray) -> Dict[str, np.ndarray]:
     nk = {}
-    for m in materials:
-        path = os.path.join(nk_dir, f"{m}.csv")
+    for mat in materials:
+        path = os.path.join(nk_dir, f"{mat}.csv")
         if not os.path.exists(path):
-            raise FileNotFoundError(f"nk file not found: {path}")
-        df = pd.read_csv(path)
-        wl = df.iloc[:, 0].to_numpy()
-        n  = df.iloc[:, 1].to_numpy()
-        k  = df.iloc[:, 2].to_numpy()
-        n_i = interp1d(wl, n, bounds_error=False, fill_value="extrapolate")(wavelengths)
-        k_i = interp1d(wl, k, bounds_error=False, fill_value="extrapolate")(wavelengths)
-        nk[m] = n_i + 1j * k_i
+            raise FileNotFoundError(f"Missing nk csv: {path}")
+
+        df = pd.read_csv(path).dropna()
+        wl = df["wl"].values.astype(np.float64)  # um
+        n = df["n"].values.astype(np.float64)
+        k = df["k"].values.astype(np.float64)
+
+        n_itp = interp1d(wl, n, bounds_error=False, fill_value="extrapolate")
+        k_itp = interp1d(wl, k, bounds_error=False, fill_value="extrapolate")
+        nk[mat] = n_itp(wavelengths_um) + 1j * k_itp(wavelengths_um)
     return nk
 
 
-# -----------------------------
-# 2) 词表解析：只允许 Mat_Thick token
-# -----------------------------
-def build_token_sets(vocab: Dict[str, int]):
-    word2idx = vocab
-    idx2word = {v: k for k, v in word2idx.items()}
+# =========================
+# 3) DBR forward: air / layers / air
+# =========================
+_LAYER_RE = re.compile(r"^([A-Za-z0-9]+)_([0-9]+)$")
 
-    struct_ids: List[int] = []
-    mat_of_id: Dict[int, str] = {}
-    thick_of_id: Dict[int, int] = {}
-
-    for wid, w in idx2word.items():
-        if "_" not in w:
-            continue
-        mat, thick = w.rsplit("_", 1)
-        if thick.isdigit():
-            struct_ids.append(wid)
-            mat_of_id[wid] = mat
-            thick_of_id[wid] = int(thick)
-
-    return idx2word, struct_ids, mat_of_id, thick_of_id
-
-
-def parse_structure(tokens: List[str]) -> Tuple[List[str], List[float]]:
+def parse_layers(tokens: List[str]) -> Tuple[List[str], List[float]]:
+    """
+    Keep only tokens like 'TiO2_123' (thickness nm is int-ish).
+    Return mats, thks_nm.
+    """
     mats, thks = [], []
     for t in tokens:
-        if "_" not in t:
+        m = _LAYER_RE.match(t.strip())
+        if not m:
             continue
-        mat, d = t.rsplit("_", 1)
-        if d.isdigit():
-            mats.append(mat)
-            thks.append(float(d))
+        mats.append(m.group(1))
+        thks.append(float(m.group(2)))
     return mats, thks
 
 
-# -----------------------------
-# 3) H/L 集合（简单 grammar）
-# -----------------------------
-def pick_HL_sets_by_n(
-    nk_dict: Dict[str, np.ndarray],
-    wavelengths: np.ndarray,
-    candidates_mats: List[str],
-    k_max_th: float = 1e-3,
-    dn_th: float = 0.15,
-) -> Tuple[Set[str], Set[str]]:
-    i_mid = len(wavelengths) // 2
-    n_med = {}
-    for m in candidates_mats:
-        if m not in nk_dict:
-            continue
-        n_med[m] = float(np.real(nk_dict[m][i_mid]))
-
-    global_med = float(np.median(list(n_med.values()))) if len(n_med) else 1.5
-
-    Hset, Lset = set(), set()
-    for m, n in n_med.items():
-        kmax = float(np.max(np.abs(np.imag(nk_dict[m])))) if m in nk_dict else 0.0
-        if kmax > k_max_th:
-            continue
-        if n >= global_med + dn_th:
-            Hset.add(m)
-        elif n <= global_med - dn_th:
-            Lset.add(m)
-
-    # 兜底：top/bottom 30%
-    if len(Hset) < 2 or len(Lset) < 2:
-        mats_sorted = sorted(n_med.items(), key=lambda kv: kv[1])
-        n = len(mats_sorted)
-        cut = max(1, int(0.3 * n))
-        Lset = set([m for m, _ in mats_sorted[:cut]])
-        Hset = set([m for m, _ in mats_sorted[-cut:]])
-
-    return Hset, Lset
-
-
-def allowed_ids_for_position(
-    pos_layer_1based: int,
-    struct_ids: List[int],
-    mat_of_id: Dict[int, str],
-    Hset: Set[str],
-    Lset: Set[str],
-) -> List[int]:
-    use_set = Hset if (pos_layer_1based % 2 == 1) else Lset
-    out = []
-    for wid in struct_ids:
-        m = mat_of_id.get(wid, None)
-        if m in use_set:
-            out.append(wid)
-    return out
-
-
-# -----------------------------
-# 4) TMM（coh_tmm）算 R/T
-# -----------------------------
-def simulate_rt(mats: List[str], thks: List[float], nk: Dict[str, np.ndarray], wl_nm: np.ndarray):
-    if len(mats) == 0:
-        # 空结构：给一个“全透”近似（避免崩）
-        R = np.zeros_like(wl_nm, dtype=np.float32)
-        T = np.ones_like(wl_nm, dtype=np.float32)
-        return R, T
+def spectrum_dbr(materials: List[str], thickness_nm: List[float], nk_dict: Dict[str, np.ndarray],
+                 pol: str = "s", theta_deg: float = 0.0) -> np.ndarray:
+    d_list = [np.inf] + list(map(float, thickness_nm)) + [np.inf]
+    th0 = np.deg2rad(theta_deg)
 
     R, T = [], []
-    d_list = [np.inf] + thks + [np.inf]
-    for i, wl in enumerate(wl_nm):
-        n_list = [1] + [nk[m][i] for m in mats] + [1]
-        res = coh_tmm("s", n_list, d_list, 0, float(wl))
+    for i, lam_nm in enumerate(WL_NM):
+        n_list = [1.0] + [nk_dict[m][i] for m in materials] + [1.0]
+        res = coh_tmm(pol=pol, n_list=n_list, d_list=d_list, th_0=th0, lam_vac=float(lam_nm))
         R.append(res["R"])
         T.append(res["T"])
-    return np.array(R, dtype=np.float32), np.array(T, dtype=np.float32)
+    return np.asarray(R + T, dtype=np.float32)  # (2W,)
 
 
-# -----------------------------
-# 5) Decode：min_len EOS + H/L grammar
-# -----------------------------
-def decode_with_minlen_and_grammar(
-    model,
-    src_spec: torch.Tensor,          # [1, spec_dim]
-    BOS: int,
-    EOS: int,
-    struct_ids: List[int],
-    mat_of_id: Dict[int, str],
-    Hset: Set[str],
-    Lset: Set[str],
-    min_len_layers: int,
-    max_len_layers: int,
-    temperature: float,
-) -> List[int]:
-    # Transformer_I：memory = fc(src)
-    with torch.no_grad():
-        memory = model.fc(src_spec)  # [1, d_model]
+# =========================
+# 4) decode (greedy)
+#    - Prefer configs.struc_word_dict / struc_index_dict like original analysis
+#    - Requires model.encode/decode/generator. If your model differs, tell me the forward signature and I’ll adapt.
+# =========================
+def subsequent_mask(size: int) -> torch.Tensor:
+    attn_shape = (1, size, size)
+    subsequent = torch.triu(torch.ones(attn_shape, dtype=torch.bool), diagonal=1)
+    return ~subsequent
 
-    ys = torch.tensor([[BOS]], device=src_spec.device, dtype=torch.long)
 
-    for _ in range(max_len_layers):
-        tgt_mask = Batch.make_std_mask(ys, PAD).to(src_spec.device)
+def _get_special_id(word_dict: Dict[str, int], candidates: List[str], name: str) -> int:
+    for c in candidates:
+        if c in word_dict:
+            return int(word_dict[c])
+    raise KeyError(f"Cannot find {name} token in struc_word_dict. Tried: {candidates}")
 
-        with torch.no_grad():
-            out = model.decode(memory, None, ys, tgt_mask)     # [1, len, d_model]
-            logp = model.generator(out[:, -1])                 # [1, vocab] (log_softmax)
 
-        gen_layers = ys.size(1) - 1  # 不含 BOS
-        # 1) min_len 前禁止 EOS
-        if gen_layers < min_len_layers:
-            logp[:, EOS] = -1e9
+@torch.no_grad()
+def greedy_decode_structure(model, configs, spec_vec: np.ndarray, max_len: int = 256) -> List[str]:
+    """
+    Input: spec_vec shape (2W,)
+    Output: list[str] predicted tokens (without BOS/EOS)
+    """
+    word_dict: Dict[str, int] = configs.struc_word_dict
+    index_dict: Dict[int, str] = configs.struc_index_dict
 
-        # 2) H/L grammar：第 (gen_layers+1) 层决定允许集合
-        pos_layer_1based = gen_layers + 1
-        allowed = allowed_ids_for_position(pos_layer_1based, struct_ids, mat_of_id, Hset, Lset)
+    bos_id = _get_special_id(word_dict, ["BOS", "<BOS>", "bos"], "BOS")
+    eos_id = _get_special_id(word_dict, ["EOS", "<EOS>", "eos"], "EOS")
 
-        # 超过 min_len 才允许 EOS
-        if gen_layers >= min_len_layers:
-            allowed = allowed + [EOS]
+    # src: (1, 1, D) for a "sequence length=1" continuous spectrum token
+    src = torch.from_numpy(spec_vec).float().view(1, 1, -1).to(DEVICE)
+    src_mask = torch.ones((1, 1, 1), dtype=torch.bool, device=DEVICE)
 
-        # mask 只允许 allowed
-        masked = torch.full_like(logp, -1e9)
-        masked[:, allowed] = logp[:, allowed]
-        logp = masked
+    # must have encode/decode/generator
+    memory = model.encode(src, src_mask)
+    ys = torch.tensor([[bos_id]], dtype=torch.long, device=DEVICE)
 
-        if temperature != 1.0:
-            logp = logp / temperature
+    out_tokens: List[str] = []
+    for _ in range(max_len):
+        tgt_mask = subsequent_mask(ys.size(1)).to(DEVICE)
+        out = model.decode(memory, src_mask, ys, tgt_mask)          # (1, L, d_model)
+        prob = model.generator(out[:, -1, :])                       # (1, vocab)
+        next_id = int(torch.argmax(prob, dim=-1).item())
 
-        nxt = int(torch.argmax(logp, dim=-1).item())
-        ys = torch.cat([ys, torch.tensor([[nxt]], device=src_spec.device, dtype=torch.long)], dim=1)
-
-        if nxt == EOS:
+        if next_id == eos_id:
             break
 
-    return ys.squeeze(0).tolist()
+        ys = torch.cat([ys, torch.tensor([[next_id]], device=DEVICE)], dim=1)
+        tok = index_dict.get(next_id, "UNK")
+        out_tokens.append(tok)
+
+    return out_tokens
 
 
-# -----------------------------
-# 6) spec_type 对齐 + MAE
-# -----------------------------
-def build_pred_spec(R: np.ndarray, T: np.ndarray, spec_type: str) -> np.ndarray:
-    if spec_type == "R":
-        return R
-    if spec_type == "T":
-        return T
-    if spec_type in ["R_T", "R+T"]:
-        return np.concatenate([R, T], axis=0)
-    raise ValueError(f"Unknown spec_type: {spec_type}")
+# =========================
+# 5) eval MAE
+# =========================
+@torch.no_grad()
+def eval_mae(model, configs,
+             spectra_gt: np.ndarray,
+             nk_dict: Dict[str, np.ndarray],
+             max_samples: int = 200,
+             max_len: int = 256,
+             spec_type: str = "R_T") -> Dict[str, Any]:
+    """
+    spec_type:
+      - R_T: MAE on [R..., T...]
+      - R  : MAE only on R
+      - T  : MAE only on T
+    """
+    N = min(max_samples, spectra_gt.shape[0])
+    maes: List[float] = []
+    bad_forward = 0
+    empty_pred = 0
 
+    for i in range(N):
+        target = spectra_gt[i]  # (2W,)
 
-def plot_and_save(gt: np.ndarray, pred: np.ndarray, save_path: str, title: str):
-    plt.figure(figsize=(6, 4))
-    plt.plot(gt, label="GT")
-    plt.plot(pred, "--", label="Pred")
-    plt.title(title)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-
-# -----------------------------
-# 7) 主流程
-# -----------------------------
-def main(cfg: Cfg):
-    print("====== DBR Validation ======")
-    print(f"Spec type: {cfg.spec_type}")
-    print(f"Device: {DEVICE}")
-
-    # 波段网格（与生成器一致）
-    wavelengths = np.arange(cfg.lam_low, cfg.lam_high, cfg.lam_step)  # 不含 lam_high
-    wl_nm = (wavelengths * 1000).astype(int)
-    n_wl = len(wavelengths)
-
-    # 读数据（PrepareData 会按 spec_type 切分/不切分）
-    data = PrepareData(
-        cfg.train_struc, cfg.train_spec, 100,
-        cfg.dev_struc, cfg.dev_spec,
-        BATCH_SIZE=1,
-        spec_type=cfg.spec_type,
-        if_inverse="Inverse",
-    )
-
-    vocab = data.struc_word_dict
-    idx2word = data.struc_index_dict
-    BOS = vocab["BOS"]
-    EOS = vocab["EOS"]
-
-    # 确认维度一致
-    spec_dim = len(data.dev_spec[0])
-    if cfg.spec_type in ["R_T", "R+T"]:
-        assert spec_dim == 2 * n_wl, f"Spec dim mismatch: data={spec_dim}, expected={2*n_wl}"
-    else:
-        assert spec_dim == n_wl, f"Spec dim mismatch: data={spec_dim}, expected={n_wl}"
-
-    # 从词表抽结构 token
-    idx2word_full, struct_ids, mat_of_id, thick_of_id = build_token_sets(vocab)
-
-    # 收集材料集合：从词表里的材料 + 你nk目录存在的
-    candidates_mats = sorted(list(set(mat_of_id.values())))
-
-    # 读 nk（只读用到的材料）
-    nk = load_nk(candidates_mats, wavelengths, cfg.nk_dir)
-
-    # H/L 分组
-    Hset, Lset = pick_HL_sets_by_n(nk, wavelengths, candidates_mats, cfg.k_max_th, cfg.dn_th)
-    print(f"[Grammar] Hset size={len(Hset)}, Lset size={len(Lset)}")
-
-    # 构造模型 & load ckpt
-    model = make_model_I(
-        src_vocab=spec_dim,
-        tgt_vocab=len(vocab),
-        N=cfg.N,
-        d_model=cfg.d_model,
-        d_ff=cfg.d_ff,
-        h=cfg.h,
-        dropout=cfg.dropout
-    ).to(DEVICE)
-
-    ckpt = torch.load(cfg.ckpt, map_location=DEVICE)
-    # 兼容不同保存字段
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
-    else:
-        model.load_state_dict(ckpt)
-    model.eval()
-
-    # 评估抽样
-    devN = len(data.dev_spec)
-    picks = np.random.choice(devN, min(cfg.num_eval, devN), replace=False)
-
-    maes_all = []
-    lengths = []
-
-    for j, idx in enumerate(picks, 1):
-        gt_spec = np.array(data.dev_spec[idx], dtype=np.float32)
-
-        src = torch.tensor(gt_spec, device=DEVICE).float().unsqueeze(0)
-
-        ids = decode_with_minlen_and_grammar(
-            model=model,
-            src_spec=src,
-            BOS=BOS,
-            EOS=EOS,
-            struct_ids=struct_ids,
-            mat_of_id=mat_of_id,
-            Hset=Hset,
-            Lset=Lset,
-            min_len_layers=cfg.min_len_layers,
-            max_len_layers=cfg.max_len_layers,
-            temperature=cfg.temperature
-        )
-
-        tokens = [idx2word[i] for i in ids if i in idx2word]
-        mats, thks = parse_structure(tokens)
-        lengths.append(len(mats))
-
-        R, T = simulate_rt(mats, thks, nk, wl_nm)
-        pred_spec = build_pred_spec(R, T, cfg.spec_type)
-
-        if pred_spec.shape != gt_spec.shape:
-            print(f"[{j}/{len(picks)}] idx={idx} SHAPE MISMATCH pred={pred_spec.shape} gt={gt_spec.shape}")
+        pred_tokens = greedy_decode_structure(model, configs, target, max_len=max_len)
+        mats, thks = parse_layers(pred_tokens)
+        if len(mats) == 0:
+            empty_pred += 1
+            # fallback: mae = 1 (or skip). Here we skip to avoid polluting results.
             continue
 
-        mae = float(np.mean(np.abs(pred_spec - gt_spec)))
-        maes_all.append(mae)
+        try:
+            pred_spec = spectrum_dbr(mats, thks, nk_dict)
+        except Exception:
+            bad_forward += 1
+            continue
 
-        if cfg.save_fig:
-            save_path = os.path.join(cfg.fig_dir, f"case_{idx:06d}_mae_{mae:.4f}.png")
-            title = f"idx={idx} | layers={len(mats)} | MAE={mae:.4f}"
-            plot_and_save(gt_spec, pred_spec, save_path, title)
-            print(f"[{j}/{len(picks)}] idx={idx} OK, layers={len(mats)}, MAE={mae:.4f}, saved={save_path}")
+        if spec_type == "R":
+            pred_use = pred_spec[:len(WAVELENGTHS)]
+            gt_use = target[:len(WAVELENGTHS)]
+        elif spec_type == "T":
+            pred_use = pred_spec[len(WAVELENGTHS):]
+            gt_use = target[len(WAVELENGTHS):]
         else:
-            print(f"[{j}/{len(picks)}] idx={idx} OK, layers={len(mats)}, MAE={mae:.4f}")
+            pred_use = pred_spec
+            gt_use = target
 
-    print("\n====== Summary ======")
-    if len(maes_all) == 0:
-        print("No valid eval cases (all mismatched).")
-        return
-    print(f"MAE (all): {np.mean(maes_all):.4f}  (n={len(maes_all)})")
-    print(f"Length mean: {np.mean(lengths):.2f} | min={np.min(lengths)} max={np.max(lengths)}")
-    print(f"Figures saved to: {cfg.fig_dir}")
+        mae = float(np.mean(np.abs(pred_use - gt_use)))
+        maes.append(mae)
+
+    report = {
+        "num_eval_requested": int(N),
+        "num_eval_used": int(len(maes)),
+        "mean_mae": float(np.mean(maes)) if maes else float("nan"),
+        "mae_list": maes,
+        "empty_pred": int(empty_pred),
+        "bad_forward": int(bad_forward),
+        "spec_type": spec_type,
+        "spec_dim": int(spectra_gt.shape[1]),
+        "num_wavelengths": int(len(WAVELENGTHS)),
+        "wavelengths_um": WAVELENGTHS,   # helpful for later plotting
+        "wavelengths_nm": WL_NM,
+    }
+    return report
+
+
+# =========================
+# 6) main
+# =========================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", type=str, required=True, help="path to your saved checkpoint .pt")
+    ap.add_argument("--dataset_dir", type=str, default="./dataset", help="contains Structure_dev.pkl & Spectrum_dev.pkl")
+    ap.add_argument("--nk_dir", type=str, default="./dataset/data", help="nk csv dir")
+    ap.add_argument("--max_samples", type=int, default=200)
+    ap.add_argument("--max_len", type=int, default=256)
+    ap.add_argument("--spec_type", type=str, default="R_T", choices=["R_T", "R", "T"])
+    ap.add_argument("--out", type=str, default="./results/eval_mae.pkl")
+    args = ap.parse_args()
+
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+
+    # ---- load ckpt/config ----
+    ckpt = torch.load(args.ckpt, map_location="cpu")
+    configs = ckpt["configs"]
+
+    # ---- build model ----
+    model = make_model_I(
+        configs.spec_dim,
+        configs.struc_dim,
+        configs.layers,
+        configs.d_model,
+        configs.d_ff,
+        configs.head_num,
+        configs.dropout
+    ).to(DEVICE)
+    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    model.eval()
+
+    if int(configs.spec_dim) != SPEC_DIM_EXPECT:
+        print(f"[WARN] configs.spec_dim={configs.spec_dim} != {SPEC_DIM_EXPECT}. "
+              f"你的训练波长点可能和当前 eval 的 (0.9–1.7, 5nm, R+T) 不一致。")
+
+    # ---- load dev ----
+    structures_gt, spectra_gt = load_dev_data(args.dataset_dir)
+    print(f"[INFO] Loaded dev: N={len(structures_gt)}, spectrum shape={spectra_gt.shape}")
+
+    # ---- collect materials to load nk ----
+    # 这里用 GT 结构里出现的材料集合；如果你预测可能超出 GT，可改成更大集合（比如 industry 白名单）
+    mats_set = set()
+    for st in structures_gt:
+        for tok in st:
+            m = tok.rsplit("_", 1)[0]
+            mats_set.add(m)
+
+    nk_dict = load_nk(sorted(mats_set), args.nk_dir, WAVELENGTHS)
+    print(f"[INFO] Loaded nk for {len(nk_dict)} materials.")
+
+    # ---- eval ----
+    report = eval_mae(
+        model=model,
+        configs=configs,
+        spectra_gt=spectra_gt,
+        nk_dict=nk_dict,
+        max_samples=args.max_samples,
+        max_len=args.max_len,
+        spec_type=args.spec_type
+    )
+
+    print("\n==== DBR Eval (MAE) ====")
+    print("spec_type        :", report["spec_type"])
+    print("num_eval_requested:", report["num_eval_requested"])
+    print("num_eval_used    :", report["num_eval_used"])
+    print("empty_pred       :", report["empty_pred"])
+    print("bad_forward      :", report["bad_forward"])
+    print("mean_mae         :", report["mean_mae"])
+
+    with open(args.out, "wb") as f:
+        pkl.dump(report, f)
+    print("[Saved]", args.out)
 
 
 if __name__ == "__main__":
-    cfg = main_config()
-    main(cfg)
+    main()
+
+
+# python eval_dbr_mae.py \
+#   --ckpt saved_models/optogpt/in_paper/optogpt.pt \
+#   --dataset_dir ./dataset \
+#   --nk_dir ./dataset/data \
+#   --max_samples 200 \
+#   --spec_type R_T
