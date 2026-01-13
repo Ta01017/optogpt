@@ -9,19 +9,6 @@ eval_dbr_simple_mae_tmmfast.py
 - Pred   MAE: greedy decode -> TMM_FAST -> spec vs dev_spec
 - 打印若干样例：gt/pred pair + head + oracle/pred mae
 - 输出整体 mae + pred pair 分布
-
-Usage:
-python eval_dbr_simple_mae_tmmfast.py \
-  --ckpt saved_models/optogpt/dbr_60k/model_inverse_best.pt \
-  --dev_struct ./dataset/dbr/Structure_dev.pkl \
-  --dev_spec   ./dataset/dbr/Spectrum_dev.pkl \
-  --nk_dir     ./dataset/data \
-  --lambda0 0.9 --lambda1 1.7 --step_um 0.005 \
-  --max_len 64 \
-  --num_eval 200 \
-  --print_k 5 \
-  --seed 0 \
-  --tmm_batch 128
 """
 
 import os
@@ -45,9 +32,6 @@ COMPLEX_DTYPE = torch.complex64
 REAL_DTYPE = torch.float32
 
 
-# -------------------------
-# utils
-# -------------------------
 def load_pickle(path):
     with open(path, "rb") as f:
         return pkl.load(f)
@@ -84,14 +68,7 @@ def infer_pair_name(tokens):
         return "INVALID"
     return f"{mats[0]}/{mats[1]}"
 
-
-# -------------------------
-# nk load -> torch (on DEVICE)
-# -------------------------
 def load_nk_torch(nk_dir, materials, wavelengths_um) -> Dict[str, torch.Tensor]:
-    """
-    nk_dict_torch[mat]: complex torch tensor, shape [W], on DEVICE
-    """
     nk = {}
     for mat in materials:
         path = os.path.join(nk_dir, f"{mat}.csv")
@@ -106,25 +83,16 @@ def load_nk_torch(nk_dir, materials, wavelengths_um) -> Dict[str, torch.Tensor]:
         n_interp = interp1d(wl, n, bounds_error=False, fill_value="extrapolate")
         k_interp = interp1d(wl, k, bounds_error=False, fill_value="extrapolate")
         nk_np = n_interp(wavelengths_um) + 1j * k_interp(wavelengths_um)
-
         nk[mat] = torch.tensor(nk_np, dtype=COMPLEX_DTYPE, device=DEVICE)
     return nk
 
 
-# -------------------------
-# TMM_FAST batch
-# -------------------------
 def _pack_batch_to_tmm_fast(
     batch_mats: List[List[str]],
     batch_thks_nm: List[List[float]],
     nk_dict_torch: Dict[str, torch.Tensor],
     wl_m: torch.Tensor,  # [W]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns:
-      n: [B, Lmax+2, W] complex
-      d: [B, Lmax+2] real meters, ends=inf
-    """
     B = len(batch_mats)
     W = wl_m.shape[0]
     Lmax = max(len(x) for x in batch_mats) if B > 0 else 0
@@ -143,12 +111,11 @@ def _pack_batch_to_tmm_fast(
         L = len(mats)
 
         if L > 0:
-            # nm -> m
-            d[bi, 1:1 + L] = torch.tensor(thks, dtype=REAL_DTYPE, device=DEVICE) * 1e-9
+            d[bi, 1:1 + L] = torch.tensor(thks, dtype=REAL_DTYPE, device=DEVICE) * 1e-9  # nm->m
             for li, m in enumerate(mats, start=1):
                 n[bi, li, :] = nk_dict_torch[m]
 
-        # pad: thickness=0, n copy last layer (zero thickness won't affect)
+        # pad: thickness=0, n copy last real layer (zero thickness won't affect)
         if L < Lmax and L > 0:
             n_pad = n[bi, L, :].clone()
             n[bi, 1 + L:1 + Lmax, :] = n_pad
@@ -165,17 +132,12 @@ def calc_spec_tmmfast_batch(
     theta_rad: torch.Tensor,
     pol: str = "s",
 ) -> np.ndarray:
-    """
-    Output:
-      spec: [B, 2W] float32 numpy, as [R..., T...]
-    """
     n, d = _pack_batch_to_tmm_fast(batch_mats, batch_thks_nm, nk_dict_torch, wl_m)
     out = tmm_fast.coh_tmm(pol, n, d, theta_rad, wl_m)
 
     R = out["R"]
     T = out["T"]
 
-    # normalize to [B, W]
     if R.ndim == 3:
         R = R[:, 0, :]
         T = T[:, 0, :]
@@ -186,23 +148,20 @@ def calc_spec_tmmfast_batch(
     return spec.detach().cpu().float().numpy()
 
 
-# -------------------------
-# greedy decode
-# -------------------------
 @torch.no_grad()
 def greedy_decode(model, struc_index_dict, struc_word_dict, spec_target, max_len, start_symbol="BOS"):
     bos_id = struc_word_dict[start_symbol]
     ys = torch.ones(1, 1, dtype=torch.long, device=DEVICE).fill_(bos_id)
 
     spec_np = np.asarray(spec_target, dtype=np.float32)
-    src = torch.from_numpy(spec_np).to(DEVICE)[None, None, :]  # (1,1,spec_dim)
+    src = torch.from_numpy(spec_np).to(DEVICE)[None, None, :]
     src_mask = None
 
     out_tokens = []
     for _ in range(max_len - 1):
         trg_mask = Variable(subsequent_mask(ys.size(1)).type_as(src.data)).to(DEVICE)
         out = model(src, Variable(ys), src_mask, trg_mask)
-        prob = model.generator(out[:, -1])  # log_softmax
+        prob = model.generator(out[:, -1])
 
         next_id = int(prob.argmax(dim=1).item())
         ys = torch.cat([ys, torch.ones(1, 1, dtype=torch.long, device=DEVICE).fill_(next_id)], dim=1)
@@ -221,23 +180,19 @@ def main():
     ap.add_argument("--dev_struct", type=str, required=True)
     ap.add_argument("--dev_spec", type=str, required=True)
     ap.add_argument("--nk_dir", type=str, default="./dataset/data")
-
     ap.add_argument("--lambda0", type=float, default=0.9)
     ap.add_argument("--lambda1", type=float, default=1.7)
     ap.add_argument("--step_um", type=float, default=0.005)
-
     ap.add_argument("--max_len", type=int, default=64)
     ap.add_argument("--num_eval", type=int, default=200, help="<=0 means all")
     ap.add_argument("--print_k", type=int, default=5, help="print first k samples")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--pair_topk", type=int, default=10)
-
     ap.add_argument("--tmm_batch", type=int, default=128, help="batch size for tmm_fast")
     args = ap.parse_args()
 
     set_seed(args.seed)
 
-    # ---- load ckpt & build model ----
     ckpt = torch.load(args.ckpt, map_location="cpu")
     cfg = ckpt["configs"]
 
@@ -250,24 +205,18 @@ def main():
     struc_word_dict = cfg.struc_word_dict
     struc_index_dict = cfg.struc_index_dict
 
-    # ---- load dev ----
-    dev_struct = load_pickle(args.dev_struct)  # list[list[str]]
-    dev_spec = np.asarray(load_pickle(args.dev_spec), dtype=np.float32)  # (N, spec_dim)
+    dev_struct = load_pickle(args.dev_struct)
+    dev_spec = np.asarray(load_pickle(args.dev_spec), dtype=np.float32)
 
     N = len(dev_spec)
     spec_dim = dev_spec.shape[1]
     assert spec_dim == cfg.spec_dim, f"spec_dim mismatch: dev_spec={spec_dim}, cfg={cfg.spec_dim}"
 
-    # ---- wavelength grid ----
     n_pts = int(round((args.lambda1 - args.lambda0) / args.step_um)) + 1
     wavelengths_um = np.linspace(args.lambda0, args.lambda1, n_pts)
     if spec_dim != 2 * n_pts:
-        raise ValueError(
-            f"spec_dim != 2*n_pts, got spec_dim={spec_dim}, 2*n_pts={2*n_pts}. "
-            f"Check lambda0/lambda1/step_um"
-        )
+        raise ValueError(f"spec_dim != 2*n_pts, got spec_dim={spec_dim}, 2*n_pts={2*n_pts}")
 
-    # ---- materials from dev_struct ----
     mats_set = set()
     for seq in dev_struct:
         for s in seq:
@@ -275,54 +224,43 @@ def main():
                 mats_set.add(s.split("_", 1)[0])
     mats = sorted(list(mats_set))
 
-    # ---- nk torch + wl/theta (SI) ----
     nk_dict_torch = load_nk_torch(args.nk_dir, mats, wavelengths_um)
-    wl_m = torch.tensor(wavelengths_um * 1e-6, dtype=REAL_DTYPE, device=DEVICE)  # [W], meters
+    wl_m = torch.tensor(wavelengths_um * 1e-6, dtype=REAL_DTYPE, device=DEVICE)  # meters
     theta_rad = torch.tensor([0.0], dtype=REAL_DTYPE, device=DEVICE)
 
-    # ---- choose subset ----
     idxs = list(range(N))
     if args.num_eval > 0 and args.num_eval < N:
         idxs = random.sample(idxs, args.num_eval)
 
-    oracle_mae_list = []
-    pred_mae_list = []
-    pair_counter = Counter()
-
-    # 为了 batch 算 tmm_fast：
-    # - oracle 用 gt mats/thks
-    # - pred 先 decode 再收集 mats/thks
     oracle_mats, oracle_thks, oracle_targets = [], [], []
     pred_mats, pred_thks, pred_targets = [], [], []
+    pred_tokens_list = []
+    pair_counter = Counter()
 
-    # 先 decode + 收集需要计算的结构，同时打印前 k
+    # 先准备好要输出的 sample 信息（先不输出 mae）
     for j, ii in enumerate(idxs):
         spec_target = dev_spec[ii]
         gt_tokens = dev_struct[ii]
 
-        # Oracle (gt)
         mats_gt, thks_gt = parse_structure_tokens(gt_tokens)
         oracle_mats.append(mats_gt)
         oracle_thks.append(thks_gt)
         oracle_targets.append(spec_target)
 
-        # Pred (decode)
         pred_tokens = greedy_decode(model, struc_index_dict, struc_word_dict, spec_target, args.max_len)
+        pred_tokens_list.append(pred_tokens)
         pair_counter[infer_pair_name(pred_tokens)] += 1
+
         mats_pred, thks_pred = parse_structure_tokens(pred_tokens)
         pred_mats.append(mats_pred)
         pred_thks.append(thks_pred)
         pred_targets.append(spec_target)
 
-        if j < args.print_k:
-            print(f"\n---- sample {ii} ----")
-            print(f"GT   pair: {infer_pair_name(gt_tokens)} | len={len(gt_tokens)}")
-            print(f"PRED pair: {infer_pair_name(pred_tokens)} | len={len(pred_tokens)}")
-            print("GT   head:", gt_tokens[:10], "..." if len(gt_tokens) > 10 else "")
-            print("PRED head:", pred_tokens[:10], "..." if len(pred_tokens) > 10 else "")
-
-    # batch 计算 oracle spec
+    # batch 计算所有 mae
+    oracle_mae_list = []
+    pred_mae_list = []
     B = max(1, int(args.tmm_batch))
+
     for st in range(0, len(idxs), B):
         ed = min(len(idxs), st + B)
 
@@ -342,9 +280,19 @@ def main():
         mae2 = np.mean(np.abs(spec_pd - targets2), axis=1)
         pred_mae_list.extend(mae2.tolist())
 
-        # 把 oracle/pred 的 mae 打回前 print_k 样本（可选：这里不再重复打印）
+    # 现在再把前 print_k 个样例补上 mae 输出
+    for j in range(min(args.print_k, len(idxs))):
+        ii = idxs[j]
+        gt_tokens = dev_struct[ii]
+        pred_tokens = pred_tokens_list[j]
+        print(f"\n---- sample {ii} ----")
+        print(f"GT   pair: {infer_pair_name(gt_tokens)} | len={len(gt_tokens)}")
+        print(f"PRED pair: {infer_pair_name(pred_tokens)} | len={len(pred_tokens)}")
+        print("GT   head:", gt_tokens[:10], "..." if len(gt_tokens) > 10 else "")
+        print("PRED head:", pred_tokens[:10], "..." if len(pred_tokens) > 10 else "")
+        print(f"Oracle MAE: {oracle_mae_list[j]:.6f}")
+        print(f"Pred   MAE: {pred_mae_list[j]:.6f}")
 
-    # ---- report ----
     oracle_mae = np.asarray(oracle_mae_list, dtype=np.float32)
     pred_mae = np.asarray(pred_mae_list, dtype=np.float32)
 
