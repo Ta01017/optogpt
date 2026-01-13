@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-eval_dbr_v3_pairdist.py
+eval_dbr_v4_teacher_forcing.py
 
-在你已有的 eval_dbr_v2_debug.py 基础上：
-- 保留 Oracle MAE / Pred MAE / 结构合法性诊断
-- 新增：统计 PRED 的 pair 分布（包括 INVALID）
-- 仍保持 wavelength grid / nm round 与生成器一致
+在 eval_dbr_v3_pairdist.py 基础上新增【实验一：Teacher-forcing 评估】：
+- 不做自回归 decode
+- 直接用 GT 结构作为 decoder 输入（tgt_in），预测 tgt_y
+- 统计：
+  1) token-level NLL（平均负对数似然）
+  2) token-level top-1 accuracy
+  3)（可选）只统计“结构 token”（排除 PAD/BOS/EOS），默认启用
+
+仍保留：
+- Oracle MAE（GT -> TMM vs dev_spec）
+- Greedy Pred MAE（decode -> TMM vs dev_spec）
+- 结构合法性统计
+- Pred pair 分布统计
 
 用法示例：
-python eval_dbr_v3_pairdist.py \
+python eval_dbr_v4_teacher_forcing.py \
   --ckpt saved_models/optogpt/dbr_60k/model_inverse_best.pt \
   --dev_struct ./dataset/dbr/Structure_dev.pkl \
   --dev_spec   ./dataset/dbr/Spectrum_dev.pkl \
@@ -17,7 +26,7 @@ python eval_dbr_v3_pairdist.py \
   --lambda0 0.9 --lambda1 1.7 --step_um 0.005 \
   --max_len 64 \
   --num_eval 200 \
-  --print_first_k 5
+  --print_first_k 2
 """
 
 import os
@@ -37,6 +46,14 @@ from tmm import coh_tmm
 from core.models.transformer import make_model_I, subsequent_mask
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# -------------------------
+# 0) pickle load
+# -------------------------
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pkl.load(f)
 
 
 # -------------------------
@@ -98,10 +115,6 @@ def parse_structure_tokens(tokens):
 
 
 def infer_pair_name_from_tokens(tokens):
-    """
-    tokens: list[str], e.g. ["TiO2_158", "SiO2_212", ...]
-    取前两层材料作为 pair_name
-    """
     mats = []
     for s in tokens:
         if "_" not in s:
@@ -115,7 +128,7 @@ def infer_pair_name_from_tokens(tokens):
 
 
 # -------------------------
-# 4) Greedy decode（保证 src shape = (1,1,spec_dim)）
+# 4) Greedy decode（free-run）
 # -------------------------
 @torch.no_grad()
 def greedy_decode(model, struc_index_dict, struc_word_dict, spec_target, max_len, start_symbol="BOS"):
@@ -153,10 +166,10 @@ def greedy_decode(model, struc_index_dict, struc_word_dict, spec_target, max_len
 # -------------------------
 SPECIAL = {"UNK", "PAD", "BOS", "EOS"}
 
-def check_structure(tokens, allowed_materials=None):
+def check_structure(tokens, allowed_materials=None, require_alternating=False):
     """
-    返回：ok(bool), info(dict)
-    - ok=True 表示基本可用（至少能 parse 出 >=1 层，并且无明显特殊 token 污染）
+    ok=True: 基本可用
+    require_alternating=True 时：不交替直接判失败（更符合 DBR）
     """
     info = {}
     info["len_tokens"] = len(tokens)
@@ -170,13 +183,11 @@ def check_structure(tokens, allowed_materials=None):
         info["reason"] = "empty_parsed"
         return False, info
 
-    # 是否交替（DBR 通常交替）
     if len(mats) >= 2:
         info["is_alternating"] = all(mats[i] != mats[i - 1] for i in range(1, len(mats)))
     else:
         info["is_alternating"] = True
 
-    # 材料是否在允许集合中
     if allowed_materials is not None:
         ood = [m for m in mats if m not in allowed_materials]
         info["num_ood_materials"] = len(ood)
@@ -185,7 +196,6 @@ def check_structure(tokens, allowed_materials=None):
         info["num_ood_materials"] = 0
         info["ood_materials_sample"] = []
 
-    # 厚度基本范围（nm，宽松阈值）
     thks_np = np.asarray(thks, dtype=np.float32)
     info["thk_min"] = float(thks_np.min())
     info["thk_max"] = float(thks_np.max())
@@ -200,14 +210,100 @@ def check_structure(tokens, allowed_materials=None):
     if info["thk_min"] <= 0 or info["thk_max"] > 5000:
         info["reason"] = "bad_thickness_range"
         return False, info
+    if require_alternating and not info.get("is_alternating", True):
+        info["reason"] = "not_alternating"
+        return False, info
 
     info["reason"] = "ok"
     return True, info
 
 
-def load_pickle(path):
-    with open(path, "rb") as f:
-        return pkl.load(f)
+# -------------------------
+# 6) Teacher-forcing 实验一：token NLL + accuracy
+# -------------------------
+@torch.no_grad()
+def teacher_forcing_metrics(model, struc_word_dict, gt_tokens, spec_target,
+                            pad_symbol="PAD", bos_symbol="BOS", eos_symbol="EOS",
+                            ignore_special=True):
+    """
+    输入：
+      - gt_tokens: list[str]，不包含 BOS/EOS（你的 pkl 里通常就是纯结构 token）
+      - spec_target: (spec_dim,)
+    输出：
+      - nll_sum, n_tok（用于汇总平均 NLL）
+      - n_correct, n_eval_tok（用于汇总 accuracy）
+    """
+
+    # ---- ids ----
+    pad_id = struc_word_dict.get(pad_symbol, 0)
+    bos_id = struc_word_dict[bos_symbol]
+    eos_id = struc_word_dict.get(eos_symbol, None)
+
+    # 把 GT token 映射为 id（若 OOV，映射为 UNK）
+    unk_id = struc_word_dict.get("UNK", None)
+
+    gt_ids = []
+    for s in gt_tokens:
+        if s in struc_word_dict:
+            gt_ids.append(struc_word_dict[s])
+        else:
+            if unk_id is None:
+                # 没有 UNK 就直接跳过（也可以 raise）
+                continue
+            gt_ids.append(unk_id)
+
+    if len(gt_ids) == 0:
+        return 0.0, 0, 0, 0
+
+    # tgt_in: [BOS] + gt_ids
+    tgt_in = [bos_id] + gt_ids
+    # tgt_y : gt_ids + [EOS]（若无 EOS，就用 PAD 代替，至少长度匹配）
+    if eos_id is None:
+        tgt_y = gt_ids + [pad_id]
+    else:
+        tgt_y = gt_ids + [eos_id]
+
+    tgt_in_t = torch.tensor(tgt_in, dtype=torch.long, device=DEVICE)[None, :]  # (1, L)
+    tgt_y_t  = torch.tensor(tgt_y,  dtype=torch.long, device=DEVICE)[None, :]  # (1, L)
+
+    # src: (1,1,spec_dim)
+    spec_np = np.asarray(spec_target, dtype=np.float32)
+    src = torch.from_numpy(spec_np).to(DEVICE)[None, None, :]
+    src_mask = None
+
+    L = tgt_in_t.size(1)
+    tgt_mask = subsequent_mask(L).type_as(src.data).to(DEVICE)
+
+    out = model(src, tgt_in_t, src_mask, tgt_mask)  # (1, L, d_model)
+    logp = model.generator(out)                      # (1, L, vocab) log_softmax
+
+    # token NLL
+    # gather: (1,L,1) -> (1,L)
+    nll = -logp.gather(-1, tgt_y_t.unsqueeze(-1)).squeeze(-1)  # (1,L)
+
+    # top-1
+    pred = logp.argmax(dim=-1)  # (1,L)
+    correct = (pred == tgt_y_t).float()
+
+    # ignore specials（默认忽略 PAD/BOS/EOS/UNK 这些位置）
+    if ignore_special:
+        ignore_ids = {pad_id, bos_id}
+        if eos_id is not None:
+            ignore_ids.add(eos_id)
+        if unk_id is not None:
+            ignore_ids.add(unk_id)
+        mask = torch.ones_like(tgt_y_t, dtype=torch.bool)
+        for iid in ignore_ids:
+            mask &= (tgt_y_t != iid)
+    else:
+        mask = torch.ones_like(tgt_y_t, dtype=torch.bool)
+
+    nll_sum = float(nll[mask].sum().item())
+    n_tok = int(mask.sum().item())
+    n_correct = float(correct[mask].sum().item())
+    n_eval_tok = n_tok
+
+    return nll_sum, n_tok, n_correct, n_eval_tok
 
 
 def main():
@@ -217,7 +313,6 @@ def main():
     ap.add_argument("--dev_spec", type=str, default="./dataset/dbr/Spectrum_dev.pkl")
     ap.add_argument("--nk_dir", type=str, default="./dataset/data")
 
-    # wavelength grid: 与生成器一致（0.005步长，round到nm）
     ap.add_argument("--lambda0", type=float, default=0.9)
     ap.add_argument("--lambda1", type=float, default=1.7)
     ap.add_argument("--step_um", type=float, default=0.005)
@@ -225,8 +320,15 @@ def main():
     ap.add_argument("--max_len", type=int, default=64)
     ap.add_argument("--num_eval", type=int, default=200, help="<=0 means all")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--print_first_k", type=int, default=2)
 
-    ap.add_argument("--print_first_k", type=int, default=5, help="print debug for first k samples")
+    # teacher forcing options
+    ap.add_argument("--tf_ignore_special", action="store_true", help="ignore PAD/BOS/EOS/UNK when computing TF metrics")
+    ap.add_argument("--tf_include_special", action="store_true", help="include specials (override)")
+
+    # structure check
+    ap.add_argument("--require_alternating", action="store_true", help="if set, non-alternating pred is invalid")
+
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -272,7 +374,6 @@ def main():
         print("[FATAL] spec_dim != 2 * n_pts")
         print("  spec_dim:", spec_dim)
         print("  n_pts:", n_pts, "=> 2*n_pts:", 2 * n_pts)
-        print("  (请检查：生成器 wavelength 点数 vs eval 的 lambda0/lambda1/step 是否一致)")
         return
 
     # ---- materials from dev_struct ----
@@ -283,7 +384,7 @@ def main():
                 mats_set.add(s.split("_", 1)[0])
     mats = sorted(list(mats_set))
     if len(mats) == 0:
-        print("[FATAL] No materials parsed from dev_struct. Check dev_struct content.")
+        print("[FATAL] No materials parsed from dev_struct.")
         return
     print("materials(from dev_struct):", mats)
 
@@ -294,6 +395,11 @@ def main():
     idxs = list(range(N))
     if args.num_eval > 0 and args.num_eval < N:
         idxs = random.sample(idxs, args.num_eval)
+
+    # ---- global sanity ----
+    print("dev_spec range: min=%.4f max=%.4f mean=%.4f" %
+          (float(dev_spec.min()), float(dev_spec.max()), float(dev_spec.mean())))
+    print("wl_nm_list head/tail:", wl_nm_list[:5].tolist(), "...", wl_nm_list[-5:].tolist())
 
     # ---- diagnostics containers ----
     mae_oracle = []
@@ -308,21 +414,42 @@ def main():
         "pred_not_alternating": 0,
         "pred_empty": 0,
         "pred_bad_thk": 0,
+        "pred_not_alternating_invalid": 0,
     }
 
-    # ---- NEW: pred pair distribution ----
     pred_pair_counter = Counter()
 
-    print("dev_spec range: min=%.4f max=%.4f mean=%.4f" %
-          (float(dev_spec.min()), float(dev_spec.max()), float(dev_spec.mean())))
-    print("wl_nm_list head/tail:", wl_nm_list[:5].tolist(), "...", wl_nm_list[-5:].tolist())
+    # ---- teacher forcing aggregates ----
+    tf_nll_sum = 0.0
+    tf_n_tok = 0
+    tf_correct = 0.0
+    tf_eval_tok = 0
+
+    ignore_special = True
+    if args.tf_include_special:
+        ignore_special = False
+    if args.tf_ignore_special:
+        ignore_special = True
 
     # ---- loop ----
     for j, ii in enumerate(idxs):
-        spec_target = dev_spec[ii]  # (spec_dim,)
-        gt_tokens = dev_struct[ii]  # list[str]
+        spec_target = dev_spec[ii]
+        gt_tokens = dev_struct[ii]
 
-        # ========== (1) ORACLE ==========
+        # ========== Teacher-forcing experiment ==========
+        nll_sum, n_tok, n_cor, n_eval = teacher_forcing_metrics(
+            model=model,
+            struc_word_dict=struc_word_dict,
+            gt_tokens=gt_tokens,
+            spec_target=spec_target,
+            ignore_special=ignore_special,
+        )
+        tf_nll_sum += nll_sum
+        tf_n_tok += n_tok
+        tf_correct += n_cor
+        tf_eval_tok += n_eval
+
+        # ========== ORACLE: GT -> TMM ==========
         mats_gt, thks_gt = parse_structure_tokens(gt_tokens)
         if len(mats_gt) == 0:
             bad_oracle += 1
@@ -334,7 +461,7 @@ def main():
             except Exception:
                 bad_oracle += 1
 
-        # ========== (2) PRED ==========
+        # ========== PRED: greedy free-run ==========
         pred_tokens = greedy_decode(
             model=model,
             struc_index_dict=struc_index_dict,
@@ -344,10 +471,19 @@ def main():
             start_symbol="BOS",
         )
 
-        # NEW: record predicted pair (even if invalid)
         pred_pair_counter[infer_pair_name_from_tokens(pred_tokens)] += 1
 
-        ok, info = check_structure(pred_tokens, allowed_materials=set(mats))
+        ok, info = check_structure(
+            pred_tokens,
+            allowed_materials=set(mats),
+            require_alternating=args.require_alternating
+        )
+
+        if not info.get("is_alternating", True):
+            stats["pred_not_alternating"] += 1
+            if args.require_alternating:
+                stats["pred_not_alternating_invalid"] += 1
+
         if not ok:
             bad_pred += 1
             if info.get("reason") == "empty_parsed":
@@ -360,9 +496,6 @@ def main():
                 stats["pred_bad_thk"] += 1
         else:
             stats["pred_ok"] += 1
-            if not info.get("is_alternating", True):
-                stats["pred_not_alternating"] += 1
-
             mats_pred, thks_pred = parse_structure_tokens(pred_tokens)
             try:
                 spec_pred = calc_RT(mats_pred, thks_pred, nk_dict, wavelengths_um)
@@ -388,12 +521,26 @@ def main():
             if len(mae_pred) > 0:
                 print("pred   MAE(last):", mae_pred[-1])
 
+            if tf_n_tok > 0:
+                print("TF running avg NLL:", tf_nll_sum / tf_n_tok,
+                      "| TF running acc:", tf_correct / max(tf_eval_tok, 1))
+
     # ---- report ----
     mae_oracle = np.asarray(mae_oracle, dtype=np.float32)
     mae_pred = np.asarray(mae_pred, dtype=np.float32)
 
     print("\n==================== REPORT ====================")
     print(f"eval requested samples: {len(idxs)}")
+
+    # Teacher forcing
+    print("\n[TEACHER FORCING] GT prefix -> next-token")
+    print("  ignore_special:", ignore_special)
+    print(f"  eval tokens: {tf_eval_tok}")
+    if tf_eval_tok > 0:
+        print(f"  avg NLL : {tf_nll_sum / tf_n_tok:.6f}  (lower is better)")
+        print(f"  top1 acc: {tf_correct / tf_eval_tok:.4%}")
+    else:
+        print("  (no tokens evaluated; check gt_tokens mapping to vocab)")
 
     # Oracle
     print("\n[ORACLE] GT structure -> TMM vs dev_spec")
@@ -404,11 +551,9 @@ def main():
         print(f"  oracle MAE median: {np.median(mae_oracle):.6f}")
         print(f"  oracle MAE p90   : {np.quantile(mae_oracle, 0.90):.6f}")
         print(f"  oracle MAE p99   : {np.quantile(mae_oracle, 0.99):.6f}")
-        if float(mae_oracle.mean()) > 1e-2:
-            print("  !! WARNING: oracle MAE 不接近 0，说明 dev_spec 与 dev_struct/TMM/波长网格/nk 之间存在不一致。")
 
     # Pred
-    print("\n[PRED] Model decode -> TMM vs dev_spec")
+    print("\n[PRED] Greedy decode -> TMM vs dev_spec")
     print(f"  valid pred samples  : {len(mae_pred)}")
     print(f"  pred failed/invalid : {bad_pred}")
     if len(mae_pred) > 0:
@@ -420,34 +565,19 @@ def main():
     # Structure diag
     print("\n[STRUCT DIAG]")
     for k, v in stats.items():
-        print(f"  {k:22s}: {v}")
+        print(f"  {k:28s}: {v}")
 
-    # NEW: Pred pair distribution
+    # Pred pair distribution
     print("\n[PRED pair distribution]")
     total_pred = sum(pred_pair_counter.values())
     for k, v in pred_pair_counter.most_common():
         print(f"  {k:20s} {v:6d} ({v / max(total_pred, 1):.3%})")
 
-    print("\nHow to interpret:")
-    print("1) 如果 oracle MAE ~ 0（比如 0.001~0.01），说明数据(dev_struct/dev_spec)与TMM计算一致，数据没问题。")
-    print("2) 如果 oracle MAE 也很大（0.1~0.5），几乎必然是：wavelength grid / nm rounding / nk插值 / dev_spec 排列顺序(R/T) 不一致。")
-    print("3) 如果 oracle MAE 很小但 pred MAE 很大，同时 pred pair 分布极度集中：模型/解码发生坍塌（与数据pair分布无关）。")
+    print("\nHow to interpret (关键):")
+    print("A) TF acc 高 + free-run 崩：典型 exposure bias / greedy陷入重复token，需要改解码或加结构约束。")
+    print("B) TF acc 也很低：模型/词表/训练目标有问题（可能 vocab 过大+长尾，或 PrepareData 的 trg_y/shift/pad 有错）。")
     print("================================================")
 
 
 if __name__ == "__main__":
     main()
-
-"""
-用法示例：
-
-python eval_dbr.py \
-  --ckpt saved_models/optogpt/dbr/best.pt \
-  --dev_struct ./dataset/Structure_dev.pkl \
-  --dev_spec ./dataset/Spectrum_dev.pkl \
-  --nk_dir ./dataset/data \
-  --lambda0 0.9 --lambda1 1.7 --step_um 0.005 \
-  --max_len 64 \
-  --num_eval 200 \
-  --print_first_k 5
-"""
