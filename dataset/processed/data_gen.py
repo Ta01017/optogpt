@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 # 0) 配置区
 # =========================
 
-NUM_SAMPLES = 6000
+NUM_SAMPLES = 60000
 
 PAIR_MIN = 6
 PAIR_MAX = 10
@@ -35,7 +35,7 @@ OUT_DIR = './pkl'
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # 训练用输出目录
-DATASET_DIR = './dataset'
+DATASET_DIR = './dataset/dbr'
 os.makedirs(DATASET_DIR, exist_ok=True)
 
 # 划分比例：train/dev = 8/2

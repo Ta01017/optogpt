@@ -43,12 +43,12 @@ if __name__ == '__main__':
     parser.add_argument('--seeds', default=42, type=int, help='random seeds')
 
     # ===== Train =====
-    parser.add_argument('--epochs', default=200, type=int, help='Num of training epoches')
+    parser.add_argument('--epochs', default=500, type=int, help='Num of training epoches')
     parser.add_argument('--ratios', default=100, type=int, help='Ratio of training dataset (%)')
     parser.add_argument('--batch_size', default=256, type=int, help='Batch size (suggest 128/256)')
-    parser.add_argument('--dropout', default=0.1, type=float, help='dropout rate')
+    parser.add_argument('--dropout', default=0.05, type=float, help='dropout rate')
     parser.add_argument('--max_lr', default=1e-3, type=float, help='NoamOpt factor (suggest 5e-4~1e-3)')
-    parser.add_argument('--warm_steps', default=8000, type=int, help='NoamOpt warmup steps (suggest 5k~12k)')
+    parser.add_argument('--warm_steps', default=16000, type=int, help='NoamOpt warmup steps (suggest 5k~12k)')
 
     parser.add_argument('--smoothing', default=0.1, type=float, help='Label smoothing for KL')
 
