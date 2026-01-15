@@ -54,7 +54,7 @@ NUM_SAMPLES = 100000
 WAVELENGTHS_UM = np.linspace(0.9, 1.7, int(round((1.7 - 0.9) / 0.005)) + 1)
 LAMBDA0_SET_UM = [0.95, 1.05, 1.20, 1.31, 1.55, 1.65]   # same style as your DBR/FP
 
-NK_DIR = "./dataset/data1"
+NK_DIR = "./dataset/data"
 OUT_DIR = "./dataset/ar_smalltoken_gpu"
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -258,11 +258,17 @@ def pack_batch_to_tmm_inputs(
     n = torch.empty((B, Lmax + 2, num_wl), dtype=COMPLEX_DTYPE, device=DEVICE)
     n[:, 0, :] = (1.0 + 0.0j)  # air
 
+    # if use_substrate_as_exit:
+    #     n[:, -1, :] = nk_dict_torch[SUBSTRATE]
+    # else:
+    #     n[:, -1, :] = (1.0 + 0.0j)
+
     if use_substrate_as_exit:
-        n[:, -1, :] = nk_dict_torch[SUBSTRATE]
+        # tmm_fast 对半无限“有损出射介质”很敏感；AR里substrate通常可视为无损
+        n_out = torch.real(nk_dict_torch[SUBSTRATE]).to(REAL_DTYPE)
+        n[:, -1, :] = n_out.to(COMPLEX_DTYPE) + 0.0j
     else:
         n[:, -1, :] = (1.0 + 0.0j)
-
     for bi in range(B):
         mats = batch_mats[bi]
         thks = batch_thks_nm[bi]
@@ -459,6 +465,23 @@ def main():
     print("\n== TOTAL token categories (unique Material_ThicknessNm) ==")
     print("TOTAL_VOCAB =", total_vocab)
     print("OBSERVED_UNIQUE_TOKENS_IN_DATA =", len(tok_cnt))
+
+    # ========= length statistics =========
+    layer_lens = [meta["num_layers"] for meta in meta_list]
+
+    min_len = min(layer_lens)
+    max_len = max(layer_lens)
+    mean_len = float(np.mean(layer_lens))
+
+    print("\n== Structure length statistics (physical layers) ==")
+    print(f"  min  = {min_len}")
+    print(f"  mean = {mean_len:.3f}")
+    print(f"  max  = {max_len}")
+
+    print("\n== Suggested transformer max_len (with BOS/EOS) ==")
+    print(f"  min required = {max_len + 2}")
+    print(f"  recommended  = {max_len + 4}  (safer)")
+
 
     print("\nDone. OUT_DIR =", OUT_DIR)
 
