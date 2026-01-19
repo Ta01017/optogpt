@@ -60,7 +60,7 @@ WAVELENGTHS_UM = np.linspace(0.9, 1.7, int(round((1.7 - 0.9) / 0.005)) + 1)
 # 少量中心波长 lambda0（决定厚度 token 数量）
 LAMBDA0_SET_UM = [0.95, 1.05, 1.20, 1.31, 1.55, 1.65]
 
-NK_DIR = "./dataset/data1"
+NK_DIR = "./dataset/data"
 OUT_DIR = "./dataset/dbr_smalltoken_gpu"
 os.makedirs(OUT_DIR, exist_ok=True)
 
