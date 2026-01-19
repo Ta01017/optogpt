@@ -102,13 +102,13 @@ def run_epoch(data, model, criterion, optimizer, epoch, DEVICE):
             loss.backward()
             optimizer.step()
             optimizer.optimizer.zero_grad()
-        loss_val = loss.item()
-        total_loss += loss_val
+
+        total_loss += loss
         total_tokens += batch.ntokens
         tokens += batch.ntokens
         if i % 50 == 1:
             elapsed = time.time() - start
-            print("Epoch {:d} Batch: {:d} Loss: {:.4f} Tokens per Sec: {:.2f}s".format(epoch, i - 1, loss_val, (tokens.float() / elapsed)))
+            print("Epoch {:d} Batch: {:d} Loss: {:.4f} Tokens per Sec: {:.2f}s".format(epoch, i - 1, loss, (tokens.float() / elapsed)))
             start = time.time()
             tokens = 0
         del out, loss

@@ -65,108 +65,54 @@ def attention(query, key, value, mask=None, dropout=None):
     return torch.matmul(p_attn, value), p_attn
 
 
-
-
 class MultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout=0.1):
-        super().__init__()
-        assert d_model % h == 0
+        "Take in model size and number of heads."
+        super(MultiHeadedAttention, self).__init__()
+        # h : number of head
+        assert d_model % h == 0 # check the h number
         self.d_k = d_model // h
         self.h = h
-
+        # 4 linear layers: WQ WK WV and final linear mapping WO  
         self.linears = clones(nn.Linear(d_model, d_model), 4)
-        self.dropout = dropout
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, query, key, value, mask=None):
-        # mask: (batch, 1, 1, seq_len) or (batch, 1, seq_len, seq_len)
+        # apply the multi-head using quick method
+
         if mask is not None:
-            mask = mask.bool()   # 必须是 bool 类型
+            # Same mask applied to all h heads.
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0) # get batch size
 
-        nbatches = query.size(0)
+        # 1) Do all the linear projections in batch from d_model => h x d_k 
+        # parttion into h sections，switch 2,3 axis for computation. 
+        query, key, value = [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2) 
+                             for l, x in zip(self.linears, (query, key, value))]
 
-        # 1) Linear projections
-        query, key, value = [
-            l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
-            for l, x in zip(self.linears, (query, key, value))
-        ]  # -> (batch, heads, seq, d_k)
+        # 2) Apply attention on all the projected vectors in batch.
+        x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
 
-        # 2) FlashAttention / SDPA
-        # note: dropout 仅在 train 时启用
-        attn_output = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=mask,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,  # 你这里是 encoder，所以不是 causal
-        )  # -> (batch, heads, seq, d_k)
+        # 3) "Concat" using a view and apply a final linear. 
+        x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
+        # contiguous: when use transpose, PyTorch does not create a new tensor and just changes the meta data
+        # use contiguous to make a copy of the tensor with transpose data 
 
-        # 3) Concat heads
-        x = attn_output.transpose(1, 2).contiguous() \
-                          .view(nbatches, -1, self.h * self.d_k)
-
-        # 4) Output linear
-        return self.linears[-1](x)
-
-
-
-# class MultiHeadedAttention(nn.Module):
-#     def __init__(self, h, d_model, dropout=0.1):
-#         "Take in model size and number of heads."
-#         super(MultiHeadedAttention, self).__init__()
-#         # h : number of head
-#         assert d_model % h == 0 # check the h number
-#         self.d_k = d_model // h
-#         self.h = h
-#         # 4 linear layers: WQ WK WV and final linear mapping WO  
-#         self.linears = clones(nn.Linear(d_model, d_model), 4)
-#         self.attn = None
-#         self.dropout = nn.Dropout(p=dropout)
-
-#     def forward(self, query, key, value, mask=None):
-#         # apply the multi-head using quick method
-
-#         if mask is not None:
-#             # Same mask applied to all h heads.
-#             mask = mask.unsqueeze(1)
-#         nbatches = query.size(0) # get batch size
-
-#         # 1) Do all the linear projections in batch from d_model => h x d_k 
-#         # parttion into h sections，switch 2,3 axis for computation. 
-#         query, key, value = [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2) 
-#                              for l, x in zip(self.linears, (query, key, value))]
-
-#         # 2) Apply attention on all the projected vectors in batch.
-#         x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
-
-#         # 3) "Concat" using a view and apply a final linear. 
-#         x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
-#         # contiguous: when use transpose, PyTorch does not create a new tensor and just changes the meta data
-#         # use contiguous to make a copy of the tensor with transpose data 
-
-#         return self.linears[-1](x) # final linear layer
+        return self.linears[-1](x) # final linear layer
 
 class LayerNorm(nn.Module):
     def __init__(self, features, eps=1e-6):
-        super().__init__()
-        self.ln = nn.LayerNorm(features, eps=eps)
+        super(LayerNorm, self).__init__()
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
 
     def forward(self, x):
-        return self.ln(x)
-
-
-# class LayerNorm(nn.Module):
-#     def __init__(self, features, eps=1e-6):
-#         super(LayerNorm, self).__init__()
-#         self.a_2 = nn.Parameter(torch.ones(features))
-#         self.b_2 = nn.Parameter(torch.zeros(features))
-#         self.eps = eps
-
-#     def forward(self, x):
-#         mean = x.mean(-1, keepdim=True) # rows
-#         std = x.std(-1, keepdim=True)
-#         x_zscore = (x - mean)/ torch.sqrt(std ** 2 + self.eps) 
-#         return self.a_2*x_zscore+self.b_2 
+        mean = x.mean(-1, keepdim=True) # rows
+        std = x.std(-1, keepdim=True)
+        x_zscore = (x - mean)/ torch.sqrt(std ** 2 + self.eps) 
+        return self.a_2*x_zscore+self.b_2 
 
 class SublayerConnection(nn.Module):
     """
