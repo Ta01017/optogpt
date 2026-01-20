@@ -2,24 +2,36 @@
 # -*- coding: utf-8 -*-
 
 """
-eval_optogpt_universal_mae_tmmfast_mix.py
+eval_mix_dataset_report.py
 
-面向“大规模混合结构数据集”的通用 eval（tmm_fast batch）：
-- Oracle MAE: GT -> TMM_FAST -> spec_pred vs dev_spec
-- Pred   MAE: greedy decode -> TMM_FAST -> spec_pred vs dev_spec
-- 可选 meta_dev.pkl:
-  * 分组统计（按 family/type）
-  * 分层抽样：保证每类结构在评估样本中的比例一致/可控
-  * per-sample exit_medium（air / substrate），支持 Glass_Substrate 等
+为“大规模混合薄膜数据集（DBR/AR/FP/RANDOM）”做验证报告：
+1) Oracle MAE: GT -> TMM_FAST vs dev_spec （检查数据是否自洽）
+2) Pred MAE  : greedy decode -> TMM_FAST vs dev_spec
+3) 分组统计：
+   - by meta['type'] (DBR/AR/FP/RANDOM)
+   - by meta['num_layers'] (长度桶)
+4) 分布统计：
+   - pred pair topK
+   - pred tokens topK
+5) 多解/歧义验证（spec-neighbors structure dispersion）：
+   - 在 dev_spec 空间找 kNN
+   - 统计邻居结构一致率 same_structure_rate
+   - 统计邻居材料pattern一致率 same_material_pattern
 
-兼容：
-- DBR / AR / FP / Multi-cavity / Random stack
-- spec_type: R / T / R_T
-- token: Material_ThicknessNm（如 TiO2_145）
-- thickness: nm（脚本会 nm->m）
-
-注意：
-- 大规模时建议用 --num_eval + --stratified，避免随机抽样时 random 占比过大。
+Usage:
+python eval_all.py \
+  --ckpt saved_models/optogpt/all_new/best.pt \
+  --dev_struct ./dataset/all_new/Structure_dev.pkl \
+  --dev_spec   ./dataset/all_new/Spectrum_dev.pkl \
+  --dev_meta   ./dataset/all_new/meta_dev.pkl \
+  --nk_dir     ./dataset/data \
+  --spec_type  R_T \
+  --max_len 64 \
+  --num_eval 2000 \
+  --tmm_batch 128 \
+  --nn_check_n 500 \
+  --nn_k 5 \
+  --print_k 8
 """
 
 import os
@@ -27,7 +39,7 @@ import argparse
 import random
 import pickle as pkl
 from collections import Counter, defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -62,7 +74,6 @@ def set_seed(seed: int):
 # token parsing helpers
 # -------------------------
 def parse_structure_tokens(tokens: List[str]) -> Tuple[List[str], List[float]]:
-    """Parse tokens like 'TiO2_145' into (mats, thks_nm). Ignore specials/unparsable."""
     mats, thks = [], []
     for s in tokens:
         if "_" not in s:
@@ -79,7 +90,6 @@ def parse_structure_tokens(tokens: List[str]) -> Tuple[List[str], List[float]]:
     return mats, thks
 
 def infer_pair_name(tokens: List[str]) -> str:
-    """Human-readable printing: first two materials."""
     mats = []
     for s in tokens:
         if "_" not in s:
@@ -90,6 +100,15 @@ def infer_pair_name(tokens: List[str]) -> str:
     if len(mats) < 2:
         return "INVALID"
     return f"{mats[0]}/{mats[1]}"
+
+def material_pattern(tokens: List[str]) -> str:
+    mats = []
+    for s in tokens:
+        if "_" in s:
+            mats.append(s.split("_", 1)[0])
+    if len(mats) == 0:
+        return "INVALID"
+    return "/".join(mats)
 
 def collect_materials_from_struct(struct_list: List[List[str]]) -> List[str]:
     mats = set()
@@ -103,7 +122,7 @@ def collect_materials_from_struct(struct_list: List[List[str]]) -> List[str]:
 # -------------------------
 # spectrum slicing
 # -------------------------
-def slice_spec_1d(spec: np.ndarray, spec_type: str) -> np.ndarray:
+def slice_spec(spec: np.ndarray, spec_type: str) -> np.ndarray:
     spec_type = spec_type.upper()
     if spec_type == "R_T":
         return spec
@@ -121,7 +140,7 @@ def slice_spec_1d(spec: np.ndarray, spec_type: str) -> np.ndarray:
 
 
 # -------------------------
-# nk loader (supports on-the-fly augmentation)
+# nk loader
 # -------------------------
 def load_nk_torch(nk_dir: str, materials: List[str], wavelengths_um: np.ndarray) -> Dict[str, torch.Tensor]:
     nk = {}
@@ -144,20 +163,16 @@ def load_nk_torch(nk_dir: str, materials: List[str], wavelengths_um: np.ndarray)
 
 
 # -------------------------
-# tmm_fast packing (exit medium per batch)
+# tmm_fast packing with exit medium
 # -------------------------
 def _pack_batch_to_tmm_fast(
     batch_mats: List[List[str]],
     batch_thks_nm: List[List[float]],
     nk_dict_torch: Dict[str, torch.Tensor],
-    wl_m: torch.Tensor,  # [W]
-    exit_medium: Optional[str] = None,  # None -> air
-    force_exit_k0: bool = False,        # for tmm_fast stability with lossy semi-inf
+    wl_m: torch.Tensor,
+    exit_medium: Optional[str] = None,
+    force_exit_k0: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    n: [B, Lmax+2, W], d: [B, Lmax+2]
-    n[:,0]=air, n[:,-1]=air or substrate material.
-    """
     B = len(batch_mats)
     W = wl_m.shape[0]
     Lmax = max(len(x) for x in batch_mats) if B > 0 else 0
@@ -174,11 +189,10 @@ def _pack_batch_to_tmm_fast(
     else:
         if exit_medium not in nk_dict_torch:
             raise KeyError(f"exit_medium={exit_medium} not in nk_dict_torch.")
+        out_nk = nk_dict_torch[exit_medium]
         if force_exit_k0:
-            n_out = torch.real(nk_dict_torch[exit_medium]).to(REAL_DTYPE)
-            n[:, -1, :] = n_out.to(COMPLEX_DTYPE) + 0.0j
-        else:
-            n[:, -1, :] = nk_dict_torch[exit_medium]
+            out_nk = torch.real(out_nk).to(REAL_DTYPE).to(COMPLEX_DTYPE) + 0.0j
+        n[:, -1, :] = out_nk
 
     for bi in range(B):
         mats = batch_mats[bi]
@@ -206,23 +220,18 @@ def calc_spec_tmmfast_batch(
     theta_rad: torch.Tensor,
     pol: str = "s",
     exit_medium: Optional[str] = None,
+    force_exit_k0: bool = True,
     spec_type: str = "R_T",
-    force_exit_k0: bool = False,
 ) -> np.ndarray:
-    """
-    return spec: [B, D] where D depends on spec_type (R/T/R_T)
-    """
     n, d = _pack_batch_to_tmm_fast(
         batch_mats, batch_thks_nm, nk_dict_torch, wl_m,
         exit_medium=exit_medium, force_exit_k0=force_exit_k0
     )
     out = tmm_fast.coh_tmm(pol, n, d, theta_rad, wl_m)
 
-    R = out["R"]
-    T = out["T"]
+    R = out["R"]; T = out["T"]
     if R.ndim == 3:
-        R = R[:, 0, :]
-        T = T[:, 0, :]
+        R = R[:, 0, :]; T = T[:, 0, :]
     elif R.ndim != 2:
         raise RuntimeError(f"Unexpected R shape: {tuple(R.shape)}")
 
@@ -240,15 +249,14 @@ def calc_spec_tmmfast_batch(
 
 
 # -------------------------
-# decode
+# greedy decode
 # -------------------------
 @torch.no_grad()
 def greedy_decode(model, struc_index_dict, struc_word_dict, spec_target, max_len, start_symbol="BOS"):
     bos_id = struc_word_dict[start_symbol]
     ys = torch.ones(1, 1, dtype=torch.long, device=DEVICE).fill_(bos_id)
 
-    spec_np = np.asarray(spec_target, dtype=np.float32)
-    src = torch.from_numpy(spec_np).to(DEVICE)[None, None, :]
+    src = torch.from_numpy(np.asarray(spec_target, dtype=np.float32)).to(DEVICE)[None, None, :]
     src_mask = None
 
     out_tokens = []
@@ -267,454 +275,299 @@ def greedy_decode(model, struc_index_dict, struc_word_dict, spec_target, max_len
     return out_tokens
 
 
-# -------------------------
-# meta/type + exit medium logic
-# -------------------------
-def infer_type_from_meta(meta: Optional[dict]) -> str:
-    """
-    尽量把你的混合数据归为可读类型：
-    - 如果 meta["family"] 存在 -> 用它（比如 DBR/AR/FP/RANDOM）
-    - 否则 fallback 到 meta["ar_family"] / meta["fp_family"] 等
-    - 都没有 -> "UNKNOWN"
-    """
-    if meta is None:
-        return "UNKNOWN"
-    if "family" in meta and meta["family"]:
-        return str(meta["family"])
-    if "type" in meta and meta["type"]:
-        return str(meta["type"])
-    if "ar_family" in meta:
-        return "AR"
-    if "fp_family" in meta:
-        return "FP"
-    return "UNKNOWN"
-
-
-def decide_exit_medium_for_sample(
-    mats_gt: List[str],
-    meta: Optional[dict],
-    global_pref: Optional[str],
-) -> Optional[str]:
-    """
-    per-sample exit medium:
-    1) 若 meta 指明 exit_medium='substrate' 或给了 substrate 材料名 -> 用 substrate
-    2) 若 GT 里出现 Glass_Substrate -> 用它
-    3) 否则用 global_pref（'air'/'none'->None 或材料名）
-    """
-    # 1) meta-driven
-    if meta is not None:
-        # 常见写法：meta["exit_medium"] = "substrate" / "air" / "Glass_Substrate"
-        em = meta.get("exit_medium", None)
-        sub = meta.get("substrate", None)
-        if isinstance(em, str):
-            ems = em.strip().lower()
-            if ems in ["air", "none", "null"]:
-                return None
-            if ems == "substrate":
-                if isinstance(sub, str) and sub.strip():
-                    return sub.strip()
-                # 没给 substrate 名，就 fall back 到 Glass_Substrate
-                return "Glass_Substrate" if "Glass_Substrate" in mats_gt else None
-            # em 直接是材料名
-            return em.strip()
-
-        # 也可能只给 substrate
-        if isinstance(sub, str) and sub.strip():
-            return sub.strip()
-
-    # 2) token contains substrate
-    if "Glass_Substrate" in mats_gt:
-        return "Glass_Substrate"
-
-    # 3) global pref
-    if global_pref is None:
+def auto_exit_medium(mats_in_data: List[str], preferred: Optional[str]) -> Optional[str]:
+    if preferred is None:
+        return "Glass_Substrate" if "Glass_Substrate" in mats_in_data else None
+    p = preferred.strip().lower()
+    if p in ["air", "none", "null"]:
         return None
-    p = global_pref.strip()
-    if p.lower() in ["air", "none", "null"]:
-        return None
-    return p
+    return preferred.strip()
 
 
-def stratified_sample_indices(
-    types: List[str],
-    total_n: int,
-    mode: str = "proportional",  # proportional | equal
-    seed: int = 0
-) -> List[int]:
+def mae_per_sample(pred: np.ndarray, tgt: np.ndarray) -> np.ndarray:
+    return np.mean(np.abs(pred - tgt), axis=1)
+
+
+def bucket_by_layers(n: int) -> str:
+    if n <= 1: return "L=1"
+    if n == 2: return "L=2"
+    if n == 3: return "L=3"
+    if 4 <= n <= 5: return "L=4-5"
+    if 6 <= n <= 10: return "L=6-10"
+    if 11 <= n <= 18: return "L=11-18"
+    return "L>=19"
+
+
+def knn_ambiguity_check(spec: np.ndarray, struct_tokens: List[List[str]], meta: List[dict], check_n: int, nn_k: int, seed: int):
     """
-    对大规模混合数据做分层抽样：
-    - proportional：按原始类型分布采样 total_n
-    - equal：每类采样相同数量（更利于对比）
+    spec-neighbors structure dispersion
+    - 在 spec 空间找最近邻
+    - 统计结构是否一致/材料pattern是否一致
     """
     rng = np.random.default_rng(seed)
-    type2idx = defaultdict(list)
-    for i, t in enumerate(types):
-        type2idx[t].append(i)
+    N = spec.shape[0]
+    idxs = rng.choice(N, size=min(check_n, N), replace=False)
 
-    keys = sorted(type2idx.keys())
-    if total_n <= 0:
-        # all
-        idxs = list(range(len(types)))
-        rng.shuffle(idxs)
-        return idxs
+    # L2 normalize for cosine distance
+    x = spec.astype(np.float32)
+    x = x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-9)
 
-    if mode == "equal":
-        k = len(keys)
-        per = max(1, total_n // max(k, 1))
-        out = []
-        for t in keys:
-            ids = type2idx[t]
-            take = min(per, len(ids))
-            out.extend(rng.choice(ids, size=take, replace=False).tolist())
-        rng.shuffle(out)
-        return out[:total_n]
+    same_struct = 0
+    same_pattern = 0
+    total_pairs = 0
+    nn_dists = []
 
-    # proportional
-    counts = np.array([len(type2idx[t]) for t in keys], dtype=np.float64)
-    probs = counts / counts.sum()
-    out = []
-    # allocate
-    alloc = np.floor(probs * total_n).astype(int)
-    # fix remainder
-    rem = total_n - int(alloc.sum())
-    if rem > 0:
-        extra = rng.choice(len(keys), size=rem, replace=True, p=probs)
-        for j in extra:
-            alloc[j] += 1
+    for ii in idxs:
+        v = x[ii:ii+1]  # [1,D]
+        # cosine dist = 1 - dot
+        dots = (x @ v.T).squeeze(1)  # [N]
+        dist = 1.0 - dots
+        dist[ii] = 1e9  # exclude itself
+        nn = np.argpartition(dist, nn_k)[:nn_k]
+        nn = nn[np.argsort(dist[nn])]
 
-    for t, take in zip(keys, alloc.tolist()):
-        ids = type2idx[t]
-        if take <= 0:
-            continue
-        take = min(take, len(ids))
-        out.extend(rng.choice(ids, size=take, replace=False).tolist())
-    rng.shuffle(out)
-    return out[:total_n]
+        gt_seq = struct_tokens[ii]
+        gt_pat = material_pattern(gt_seq)
+
+        for j in nn:
+            nn_dists.append(float(dist[j]))
+            total_pairs += 1
+            if struct_tokens[j] == gt_seq:
+                same_struct += 1
+            if material_pattern(struct_tokens[j]) == gt_pat:
+                same_pattern += 1
+
+    return {
+        "check_n": int(len(idxs)),
+        "nn_k": int(nn_k),
+        "mean_nn_dist": float(np.mean(nn_dists)) if nn_dists else 0.0,
+        "same_structure_rate": float(same_struct / max(total_pairs, 1)),
+        "same_material_pattern": float(same_pattern / max(total_pairs, 1)),
+    }
 
 
-# -------------------------
-# main
-# -------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--dev_struct", type=str, required=True)
     ap.add_argument("--dev_spec", type=str, required=True)
-    ap.add_argument("--dev_meta", type=str, default=None, help="optional meta_dev.pkl for type/exit-medium")
+    ap.add_argument("--dev_meta", type=str, required=True)
 
-    ap.add_argument("--nk_dir", type=str, default="./dataset/data1")
+    ap.add_argument("--nk_dir", type=str, default="./dataset/data")
     ap.add_argument("--lambda0", type=float, default=0.9)
     ap.add_argument("--lambda1", type=float, default=1.7)
     ap.add_argument("--step_um", type=float, default=0.005)
 
-    ap.add_argument("--spec_type", type=str, default="R_T", help="R / T / R_T")
-    ap.add_argument("--exit_medium", type=str, default=None,
-                    help="global fallback exit medium: material name or 'air'. "
-                         "If meta provides per-sample exit, it overrides.")
-    ap.add_argument("--force_exit_k0", action="store_true",
-                    help="force exit medium k=0 (use real(n)) for stability with semi-infinite lossy substrate.")
-    ap.add_argument("--pol", type=str, default="s", help="s or p")
+    ap.add_argument("--spec_type", type=str, default="R_T")
+    ap.add_argument("--exit_medium", type=str, default=None)  # air/none/material
+    ap.add_argument("--force_exit_k0", action="store_true", help="force exit medium k=0 (recommended for substrate)")
+    ap.add_argument("--pol", type=str, default="s")
 
     ap.add_argument("--max_len", type=int, default=64)
-    ap.add_argument("--num_eval", type=int, default=200, help="<=0 means all")
-    ap.add_argument("--stratified", action="store_true", help="use stratified sampling by type (needs meta)")
-    ap.add_argument("--strat_mode", type=str, default="proportional", help="proportional | equal (needs meta)")
-    ap.add_argument("--print_k", type=int, default=5)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--pair_topk", type=int, default=10)
+    ap.add_argument("--num_eval", type=int, default=2000, help="<=0 means all")
+    ap.add_argument("--print_k", type=int, default=8)
     ap.add_argument("--tmm_batch", type=int, default=128)
-    args = ap.parse_args()
+    ap.add_argument("--seed", type=int, default=0)
 
+    ap.add_argument("--pair_topk", type=int, default=10)
+    ap.add_argument("--token_topk", type=int, default=10)
+
+    ap.add_argument("--nn_check_n", type=int, default=500)
+    ap.add_argument("--nn_k", type=int, default=5)
+
+    args = ap.parse_args()
     set_seed(args.seed)
 
+    # load data
+    dev_struct = load_pickle(args.dev_struct)
+    dev_meta = load_pickle(args.dev_meta)
+    dev_spec_all = np.asarray(load_pickle(args.dev_spec), dtype=np.float32)
+
+    if not (len(dev_struct) == len(dev_meta) == len(dev_spec_all)):
+        raise ValueError("dev_struct/dev_meta/dev_spec length mismatch")
+
+    # wavelength grid
+    n_pts = int(round((args.lambda1 - args.lambda0) / args.step_um)) + 1
+    wavelengths_um = np.linspace(args.lambda0, args.lambda1, n_pts)
+    wl_m = torch.tensor(wavelengths_um * 1e-6, dtype=REAL_DTYPE, device=DEVICE)
+    theta_rad = torch.tensor([0.0], dtype=REAL_DTYPE, device=DEVICE)
+
+    # slice spec
+    dev_spec = np.stack([slice_spec(dev_spec_all[i], args.spec_type) for i in range(len(dev_spec_all))], axis=0)
+
+    # load model
     ckpt = torch.load(args.ckpt, map_location="cpu")
     cfg = ckpt["configs"]
-
-    # model
-    model = make_model_I(
-        cfg.spec_dim, cfg.struc_dim, cfg.layers, cfg.d_model, cfg.d_ff, cfg.head_num, cfg.dropout
-    ).to(DEVICE)
+    model = make_model_I(cfg.spec_dim, cfg.struc_dim, cfg.layers, cfg.d_model, cfg.d_ff, cfg.head_num, cfg.dropout).to(DEVICE)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+
+    if dev_spec.shape[1] != cfg.spec_dim:
+        raise ValueError(f"spec_dim mismatch: dev_spec={dev_spec.shape[1]} vs ckpt={cfg.spec_dim}")
 
     struc_word_dict = cfg.struc_word_dict
     struc_index_dict = cfg.struc_index_dict
 
-    dev_struct = load_pickle(args.dev_struct)
-    dev_spec_all = load_pickle(args.dev_spec)
+    # choose eval subset
+    N = len(dev_spec)
+    idxs = list(range(N))
+    if args.num_eval > 0 and args.num_eval < N:
+        idxs = random.sample(idxs, args.num_eval)
 
-    # dev_spec 可能是 list[list[float]]，转 np.float32（大规模注意内存：建议先 num_eval 小抽样）
-    dev_spec_all = np.asarray(dev_spec_all, dtype=np.float32)
+    # materials & exit medium
+    mats_in_data = collect_materials_from_struct([dev_struct[i] for i in idxs])
+    exit_medium = auto_exit_medium(mats_in_data, args.exit_medium)
 
-    N = len(dev_spec_all)
-    if N != len(dev_struct):
-        raise ValueError(f"len(dev_spec)={N} != len(dev_struct)={len(dev_struct)}")
-
-    dev_meta = None
-    types = ["UNKNOWN"] * N
-    if args.dev_meta is not None and os.path.exists(args.dev_meta):
-        dev_meta = load_pickle(args.dev_meta)
-        if len(dev_meta) != N:
-            raise ValueError(f"len(dev_meta)={len(dev_meta)} != N={N}")
-        types = [infer_type_from_meta(dev_meta[i]) for i in range(N)]
-
-    # Wavelength grid
-    n_pts = int(round((args.lambda1 - args.lambda0) / args.step_um)) + 1
-    wavelengths_um = np.linspace(args.lambda0, args.lambda1, n_pts)
-
-    # Slice dev_spec by spec_type
-    #（大规模避免 python for 逐条太慢：这里仍然 O(N)，但你通常会 num_eval；若全量可改成向量化）
-    dev_spec = np.stack([slice_spec_1d(dev_spec_all[i], args.spec_type) for i in range(N)], axis=0)
-    spec_dim = dev_spec.shape[1]
-    if spec_dim != cfg.spec_dim:
-        raise ValueError(f"spec_dim mismatch after slicing: dev_spec={spec_dim}, cfg={cfg.spec_dim} "
-                         f"(train spec_type must match eval spec_type)")
-
-    # pick indices
-    if args.stratified and dev_meta is None:
-        raise ValueError("--stratified requires --dev_meta meta_dev.pkl")
-
-    if args.stratified and args.num_eval > 0:
-        idxs = stratified_sample_indices(types, args.num_eval, mode=args.strat_mode, seed=args.seed)
-    else:
-        idxs = list(range(N))
-        if args.num_eval > 0 and args.num_eval < N:
-            idxs = random.sample(idxs, args.num_eval)
-
-    # Collect GT materials first (only in selected idxs to reduce nk load)
-    mats_in_data = set()
-    for ii in idxs:
-        for s in dev_struct[ii]:
-            if "_" in s:
-                mats_in_data.add(s.split("_", 1)[0])
-    mats_in_data = sorted(list(mats_in_data))
-
-    # nk (start with GT mats; pred new mats will be loaded on the fly)
-    nk_dict_torch = load_nk_torch(args.nk_dir, mats_in_data, wavelengths_um)
-
-    wl_m = torch.tensor(wavelengths_um * 1e-6, dtype=REAL_DTYPE, device=DEVICE)
-    theta_rad = torch.tensor([0.0], dtype=REAL_DTYPE, device=DEVICE)
+    materials_to_load = set(mats_in_data)
+    if exit_medium is not None:
+        materials_to_load.add(exit_medium)
+    nk_dict = load_nk_torch(args.nk_dir, sorted(list(materials_to_load)), wavelengths_um)
 
     # containers
+    oracle_mats, oracle_thks, targets = [], [], []
+    pred_mats, pred_thks = [], []
+    pred_tokens_list = []
+    pair_counter = Counter()
+    token_counter = Counter()
+
+    type_list = []
+    layer_list = []
+
+    # build lists
+    for ii in idxs:
+        spec_tgt = dev_spec[ii]
+        gt_tokens = dev_struct[ii]
+        meta = dev_meta[ii]
+
+        # meta keys: type / num_layers
+        typ = meta.get("type", "UNKNOWN")
+        nl = int(meta.get("num_layers", len(gt_tokens)))
+
+        type_list.append(typ)
+        layer_list.append(nl)
+
+        mats_gt, thks_gt = parse_structure_tokens(gt_tokens)
+        oracle_mats.append(mats_gt)
+        oracle_thks.append(thks_gt)
+        targets.append(spec_tgt)
+
+        pred_tokens = greedy_decode(model, struc_index_dict, struc_word_dict, spec_tgt, args.max_len)
+        pred_tokens_list.append(pred_tokens)
+
+        pair_counter[infer_pair_name(pred_tokens)] += 1
+        for t in pred_tokens:
+            token_counter[t] += 1
+
+        mats_pd, thks_pd = parse_structure_tokens(pred_tokens)
+        pred_mats.append(mats_pd)
+        pred_thks.append(thks_pd)
+
+    # ensure nk coverage for predicted materials (lazy-load)
+    def ensure_nk(batch_pred_mats: List[List[str]]):
+        new_mats = set()
+        for mats in batch_pred_mats:
+            for m in mats:
+                if m not in nk_dict:
+                    new_mats.add(m)
+        if new_mats:
+            nk_dict.update(load_nk_torch(args.nk_dir, sorted(list(new_mats)), wavelengths_um))
+
+    # batch compute oracle/pred mae
+    B = max(1, int(args.tmm_batch))
     oracle_mae = []
     pred_mae = []
-    pred_pair_counter = Counter()
-    pred_len_counter = Counter()
-    pred_tok_counter = Counter()
 
-    # per-type containers
-    per_type_oracle = defaultdict(list)
-    per_type_pred = defaultdict(list)
-    per_type_len = defaultdict(list)
-    per_type_pair = defaultdict(Counter)
-
-    # sample cache for printing
-    sample_cache = []
-
-    # on-the-fly nk load for unseen predicted mats
-    def ensure_nk(materials: List[str]):
-        new_mats = [m for m in materials if m not in nk_dict_torch]
-        if new_mats:
-            nk_new = load_nk_torch(args.nk_dir, sorted(list(set(new_mats))), wavelengths_um)
-            nk_dict_torch.update(nk_new)
-
-    # batching: 为了支持“每样本 exit_medium 可能不同”，我们把 batch 内按 exit_medium 分桶
-    B = max(1, int(args.tmm_batch))
-
-    # decode & evaluate in chunks
     for st in range(0, len(idxs), B):
-        chunk = idxs[st: st + B]
+        ed = min(len(idxs), st + B)
 
-        # ---- build chunk data ----
-        gt_mats_list, gt_thks_list = [], []
-        pred_mats_list, pred_thks_list = [], []
-        tgt_specs = []
-        exit_list = []
-        type_list = []
-        gt_tokens_list = []
-        pred_tokens_list = []
+        spec_or = calc_spec_tmmfast_batch(
+            oracle_mats[st:ed], oracle_thks[st:ed], nk_dict,
+            wl_m, theta_rad, pol=args.pol,
+            exit_medium=exit_medium, force_exit_k0=args.force_exit_k0,
+            spec_type=args.spec_type
+        )
+        tgt = np.asarray(targets[st:ed], dtype=np.float32)
+        oracle_mae.extend(mae_per_sample(spec_or, tgt).tolist())
 
-        for ii in chunk:
-            tgt = dev_spec[ii]
-            gt_tokens = dev_struct[ii]
-            meta_i = dev_meta[ii] if dev_meta is not None else None
-            tname = types[ii] if dev_meta is not None else "UNKNOWN"
-
-            mats_gt, thks_gt = parse_structure_tokens(gt_tokens)
-
-            # decode pred
-            pred_tokens = greedy_decode(model, struc_index_dict, struc_word_dict, tgt, args.max_len)
-            mats_pd, thks_pd = parse_structure_tokens(pred_tokens)
-
-            # decide exit medium per sample
-            em = decide_exit_medium_for_sample(mats_gt, meta_i, args.exit_medium)
-
-            gt_mats_list.append(mats_gt)
-            gt_thks_list.append(thks_gt)
-            pred_mats_list.append(mats_pd)
-            pred_thks_list.append(thks_pd)
-            tgt_specs.append(tgt)
-            exit_list.append(em)
-            type_list.append(tname)
-            gt_tokens_list.append(gt_tokens)
-            pred_tokens_list.append(pred_tokens)
-
-            # counters (pred)
-            pn = infer_pair_name(pred_tokens)
-            pred_pair_counter[pn] += 1
-            pred_len_counter[len(pred_tokens)] += 1
-            per_type_pair[tname][pn] += 1
-            for tok in pred_tokens:
-                if "_" in tok:
-                    pred_tok_counter[tok] += 1
-
-        tgt_specs = np.asarray(tgt_specs, dtype=np.float32)
-
-        # ensure nk for predicted materials in this chunk
-        ensure_nk([m for mats in pred_mats_list for m in mats])
-        # also ensure nk for exit media if any
-        ensure_nk([em for em in exit_list if em is not None])
-
-        # ---- evaluate oracle/pred grouped by exit_medium ----
-        # group indices in chunk by exit_medium (air=None vs substrate material)
-        group_map = defaultdict(list)
-        for j, em in enumerate(exit_list):
-            group_map[em].append(j)
-
-        for em, js in group_map.items():
-            # oracle
-            spec_or = calc_spec_tmmfast_batch(
-                [gt_mats_list[j] for j in js],
-                [gt_thks_list[j] for j in js],
-                nk_dict_torch, wl_m, theta_rad,
-                pol=args.pol, exit_medium=em,
-                spec_type=args.spec_type,
-                force_exit_k0=args.force_exit_k0,
-            )
-            # pred
-            spec_pd = calc_spec_tmmfast_batch(
-                [pred_mats_list[j] for j in js],
-                [pred_thks_list[j] for j in js],
-                nk_dict_torch, wl_m, theta_rad,
-                pol=args.pol, exit_medium=em,
-                spec_type=args.spec_type,
-                force_exit_k0=args.force_exit_k0,
-            )
-
-            tgt_js = tgt_specs[js]
-            mae_or = np.mean(np.abs(spec_or - tgt_js), axis=1)
-            mae_pd = np.mean(np.abs(spec_pd - tgt_js), axis=1)
-
-            # write back
-            for k, j in enumerate(js):
-                oracle_mae.append(float(mae_or[k]))
-                pred_mae.append(float(mae_pd[k]))
-
-                tname = type_list[j]
-                per_type_oracle[tname].append(float(mae_or[k]))
-                per_type_pred[tname].append(float(mae_pd[k]))
-                per_type_len[tname].append(len(pred_tokens_list[j]))
-
-        # ---- cache samples for printing (first print_k) ----
-        for j in range(len(chunk)):
-            if len(sample_cache) >= args.print_k:
-                break
-            sample_cache.append(dict(
-                idx=chunk[j],
-                type=type_list[j],
-                exit=exit_list[j] if exit_list[j] is not None else "air",
-                gt=gt_tokens_list[j],
-                pred=pred_tokens_list[j],
-            ))
+        ensure_nk(pred_mats[st:ed])
+        spec_pd = calc_spec_tmmfast_batch(
+            pred_mats[st:ed], pred_thks[st:ed], nk_dict,
+            wl_m, theta_rad, pol=args.pol,
+            exit_medium=exit_medium, force_exit_k0=args.force_exit_k0,
+            spec_type=args.spec_type
+        )
+        pred_mae.extend(mae_per_sample(spec_pd, tgt).tolist())
 
     oracle_mae = np.asarray(oracle_mae, dtype=np.float32)
     pred_mae = np.asarray(pred_mae, dtype=np.float32)
 
-    # ---- print samples ----
-    for it, s in enumerate(sample_cache):
-        ii = s["idx"]
-        gt_tokens = s["gt"]
-        pred_tokens = s["pred"]
+    # print some samples
+    for j in range(min(args.print_k, len(idxs))):
+        ii = idxs[j]
+        gt_tokens = dev_struct[ii]
+        pred_tokens = pred_tokens_list[j]
+        meta = dev_meta[ii]
         print(f"\n---- sample {ii} ----")
-        print(f"type={s['type']} | exit={s['exit']}")
+        print(f"type={meta.get('type','?')} | num_layers={meta.get('num_layers',len(gt_tokens))}")
         print(f"GT   pair: {infer_pair_name(gt_tokens)} | len={len(gt_tokens)}")
         print(f"PRED pair: {infer_pair_name(pred_tokens)} | len={len(pred_tokens)}")
         print("GT   head:", gt_tokens[:10], "..." if len(gt_tokens) > 10 else "")
         print("PRED head:", pred_tokens[:10], "..." if len(pred_tokens) > 10 else "")
-        print(f"Oracle MAE: {oracle_mae[it]:.6f}")
-        print(f"Pred   MAE: {pred_mae[it]:.6f}")
+        print(f"Oracle MAE: {oracle_mae[j]:.6f}")
+        print(f"Pred   MAE: {pred_mae[j]:.6f}")
 
-    # ---- overall ----
+    # group stats by type
+    by_type = defaultdict(list)
+    by_layerbucket = defaultdict(list)
+
+    for m, t, nl in zip(pred_mae.tolist(), type_list, layer_list):
+        by_type[t].append(m)
+        by_layerbucket[bucket_by_layers(nl)].append(m)
+
     print("\n==================== OVERALL ====================")
-    print(f"eval samples: {len(oracle_mae)} (from total N={N})")
-    print(f"spec_type={args.spec_type} | pol={args.pol} | force_exit_k0={args.force_exit_k0}")
-    print(f"loaded_materials={len(nk_dict_torch)}")
-    if dev_meta is not None:
-        type_cnt = Counter([types[i] for i in idxs])
-        print(f"types_in_eval={len(type_cnt)} | stratified={args.stratified} mode={args.strat_mode}")
-        for k, v in type_cnt.most_common(20):
-            print(f"  type={k:10s}  {v:6d} ({v/len(idxs):.2%})")
+    print(f"eval samples: {len(idxs)} / total_dev={N}")
+    print(f"spec_type={args.spec_type} | pol={args.pol} | exit_medium={exit_medium or 'air'} | force_exit_k0={args.force_exit_k0}")
+    print(f"[Oracle MAE] mean={oracle_mae.mean():.6f} median={np.median(oracle_mae):.6f} p90={np.quantile(oracle_mae,0.90):.6f}")
+    print(f"[Pred   MAE] mean={pred_mae.mean():.6f} median={np.median(pred_mae):.6f} p90={np.quantile(pred_mae,0.90):.6f}")
 
-    print("\n[Oracle MAE] (GT -> TMM_FAST vs dev_spec)")
-    print(f"  mean  : {oracle_mae.mean():.6f}")
-    print(f"  median: {np.median(oracle_mae):.6f}")
-    print(f"  p90   : {np.quantile(oracle_mae, 0.90):.6f}")
+    print("\n================= BY TYPE =================")
+    for k in sorted(by_type.keys()):
+        arr = np.asarray(by_type[k], dtype=np.float32)
+        print(f"{k:8s}  n={len(arr):6d}  mean={arr.mean():.6f}  median={np.median(arr):.6f}  p90={np.quantile(arr,0.90):.6f}")
 
-    print("\n[Pred MAE] (Pred(greedy) -> TMM_FAST vs dev_spec)")
-    print(f"  mean  : {pred_mae.mean():.6f}")
-    print(f"  median: {np.median(pred_mae):.6f}")
-    print(f"  p90   : {np.quantile(pred_mae, 0.90):.6f}")
+    print("\n============= BY NUM_LAYERS BUCKET =============")
+    order = ["L=1","L=2","L=3","L=4-5","L=6-10","L=11-18","L>=19"]
+    for k in order:
+        if k not in by_layerbucket: 
+            continue
+        arr = np.asarray(by_layerbucket[k], dtype=np.float32)
+        print(f"{k:6s}  n={len(arr):6d}  mean={arr.mean():.6f}  median={np.median(arr):.6f}  p90={np.quantile(arr,0.90):.6f}")
 
-    # ---- per-type ----
-    if dev_meta is not None:
-        print("\n==================== PER-TYPE ====================")
-        keys = sorted(per_type_pred.keys())
-        for t in keys:
-            om = np.asarray(per_type_oracle[t], dtype=np.float32)
-            pm = np.asarray(per_type_pred[t], dtype=np.float32)
-            ln = per_type_len[t]
-            if len(pm) == 0:
-                continue
-            print(f"\n[type={t}] n={len(pm)}")
-            print(f"  Oracle mean={om.mean():.6f} | Pred mean={pm.mean():.6f} | Pred median={np.median(pm):.6f} | Pred p90={np.quantile(pm,0.90):.6f}")
-            print(f"  Pred length: min={min(ln)} mean={float(np.mean(ln)):.3f} max={max(ln)}")
-            top_pairs = per_type_pair[t].most_common(5)
-            if top_pairs:
-                print("  Top pred pairs:", ", ".join([f"{k}({v})" for k, v in top_pairs]))
+    print("\n============= PRED DISTRIBUTIONS =============")
+    total_pairs = sum(pair_counter.values())
+    print(f"[Pred pair top {args.pair_topk}]")
+    for k, v in pair_counter.most_common(args.pair_topk):
+        print(f"  {k:20s} {v:8d} ({v/max(total_pairs,1):.3%})")
 
-    # ---- distributions ----
-    print("\n[PRED pair distribution] (top %d)" % args.pair_topk)
-    total = sum(pred_pair_counter.values())
-    for k, v in pred_pair_counter.most_common(args.pair_topk):
-        print(f"  {k:20s} {v:6d} ({v/max(total,1):.3%})")
+    total_tok = sum(token_counter.values())
+    print(f"\n[Pred token top {args.token_topk}]")
+    for k, v in token_counter.most_common(args.token_topk):
+        print(f"  {k:20s} {v:8d} ({v/max(total_tok,1):.3%})")
 
-    print("\n[PRED length distribution] (top 10)")
-    total2 = sum(pred_len_counter.values())
-    for k, v in pred_len_counter.most_common(10):
-        print(f"  len={k:3d} {v:6d} ({v/max(total2,1):.3%})")
+    print("\n============= AMBIGUITY CHECK (spec-neighbors) =============")
+    # 在同一个 idxs 子集上做 kNN（更公平）
+    spec_sub = dev_spec[idxs]
+    struct_sub = [dev_struct[i] for i in idxs]
+    meta_sub = [dev_meta[i] for i in idxs]
+    amb = knn_ambiguity_check(spec_sub, struct_sub, meta_sub, args.nn_check_n, args.nn_k, args.seed)
+    print(f"[Ambiguity NN Check] (spec-neighbors structure dispersion)")
+    print(f"  check_n={amb['check_n']} | nn_k={amb['nn_k']}")
+    print(f"  mean_nn_dist           = {amb['mean_nn_dist']:.6f}")
+    print(f"  same_structure_rate    = {amb['same_structure_rate']*100:.3f}%")
+    print(f"  same_material_pattern  = {amb['same_material_pattern']*100:.3f}%")
 
-    print("\n[Top predicted tokens] (top 10)")
-    tot_tok = sum(pred_tok_counter.values())
-    for k, v in pred_tok_counter.most_common(10):
-        print(f"  {k:18s} {v:7d} ({v/max(tot_tok,1):.3%})")
-
-    print("==================================================")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
     main()
-
-"""
-python eval_all.py \
-  --ckpt saved_models/optogpt/mix_1m/model_inverse_best.pt \
-  --dev_struct ./dataset/mix/Structure_dev.pkl \
-  --dev_spec   ./dataset/mix/Spectrum_dev.pkl \
-  --dev_meta   ./dataset/mix/meta_dev.pkl \
-  --nk_dir     ./dataset/data1 \
-  --spec_type  R_T \
-  --max_len 22 \
-  --num_eval 2000 \
-  --stratified --strat_mode proportional \
-  --tmm_batch 128 \
-  --print_k 10
-"""
