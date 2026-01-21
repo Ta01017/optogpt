@@ -2,42 +2,60 @@
 # -*- coding: utf-8 -*-
 
 """
-summarize_for_report.py
+summarize_optogpt_dataset_v2_report.py
 
-Report-friendly summary for OptoGPT-style dataset.
-- Only uses TRAIN + DEV (ignores TEST).
-- Prints copy-paste summary text:
-  materials count/list
-  pair count/topK (adjacent pairs + head pairs)
-  thickness values (unique sorted) & per-material thickness ranges
+Changes vs v1:
+1) Ignore test split (only train + dev).
+2) Print a report-friendly block:
+   - 材料种类（数量+列表）
+   - 组合种类（数量+详细列表）
+     * head_pair: 首两层材料对
+     * adjacent_pair: 相邻层材料对（更全面）
+   - 厚度具体取值（全局厚度档位 + 每种材料各自出现过的厚度档位）
+3) Keep outputs: summary.json / summary.txt / overlay plots + sampled curves numpy.
 
 Assumes:
-- Structure_train.pkl / Structure_dev.pkl exist under DATA_DIR
-- meta_train.pkl / meta_dev.pkl optional (if exists, prints type ratio)
+- Structure_{train,dev}.pkl: List[List[str]] token="Material_ThicknessNm"
+- Spectrum_{train,dev}.pkl : List[List[float]] each spec is [R..., T...] (2W)
+- meta_{train,dev}.pkl optional
 """
 
 import os
+import json
 import pickle as pkl
 from collections import Counter, defaultdict
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
+
 import numpy as np
+import matplotlib.pyplot as plt
 
-# ======================
-# Config (change this)
-# ======================
-DATA_DIR = "./dataset/mix_optogpt_style_v2p1_noFP_noShortAR"  # <-- change
-TOPK = 20                 # top-k pairs to print
-SHOW_MATERIAL_LIST = True # print material names list
-SHOW_THK_VALUES = True    # print unique thickness values set
-MAX_THK_VALUES_PRINT = 200  # avoid printing thousands if too many
 
-# Choose which splits to include
-USE_TRAIN = True
-USE_DEV = True
+# =========================
+# Config: CHANGE THESE
+# =========================
+DATA_DIR = "./dataset/mix_optogpt_style_v2"   # <-- change to your OUT_DIR
+OUT_DIR = os.path.join(DATA_DIR, "_summary")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# ======================
+# Wavelength grid (must match generator)
+LAMBDA0 = 0.9
+LAMBDA1 = 1.7
+STEP_UM = 0.005
+
+# Plot controls (avoid drawing too many)
+MAX_CURVES_PER_SPLIT = 800   # train and dev each
+RANDOM_SEED = 42
+
+# "R_T" plots R and T separately; "R" only plots R; "T" only plots T
+PLOT_MODE = "R_T"  # "R" or "T" or "R_T"
+
+# How many pairs / thickness values to print in REPORT BLOCK
+REPORT_MAX_LIST = 5000  # large enough; you said need "详细的都要"
+
+
+# =========================
 # Helpers
-# ======================
+# =========================
 def load_pkl(path: str):
     with open(path, "rb") as f:
         return pkl.load(f)
@@ -50,7 +68,7 @@ def parse_token(tok: str):
     try:
         thk = int(float(t))
     except Exception:
-        thk = None
+        return m, None
     return m, thk
 
 def head_pair(tokens: List[str]) -> str:
@@ -75,198 +93,353 @@ def adjacent_pairs(tokens: List[str]) -> List[str]:
         mats.append(m)
     return [f"{mats[i]}/{mats[i+1]}" for i in range(len(mats) - 1)]
 
-def safe_meta_type(m):
-    if isinstance(m, dict) and "type" in m:
-        return m["type"]
-    return None
+def slice_spec(spec: np.ndarray, mode: str) -> np.ndarray:
+    mode = mode.upper()
+    if mode == "R_T":
+        return spec
+    L = spec.shape[0]
+    if L % 2 != 0:
+        raise ValueError(f"spec length {L} not even; cannot split R/T")
+    W = L // 2
+    if mode == "R":
+        return spec[:W]
+    if mode == "T":
+        return spec[W:]
+    raise ValueError(mode)
 
-# ======================
-# Main
-# ======================
-def main():
-    splits = []
-    if USE_TRAIN:
-        splits.append("train")
-    if USE_DEV:
-        splits.append("dev")
+def safe_sample_indices(n: int, k: int, rng: np.random.Generator):
+    if n <= k:
+        return np.arange(n, dtype=np.int64)
+    return rng.choice(n, size=k, replace=False)
 
-    all_structs = []
-    all_metas = []
+def plot_overlay(curves: np.ndarray, wavelengths: np.ndarray, title: str, save_path: str):
+    plt.figure()
+    for i in range(curves.shape[0]):
+        plt.plot(wavelengths, curves[i])
+    plt.xlabel("Wavelength (um)")
+    plt.ylabel("R/T")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
 
-    for sp in splits:
-        sp_struct = os.path.join(DATA_DIR, f"Structure_{sp}.pkl")
-        if not os.path.exists(sp_struct):
-            raise FileNotFoundError(f"Missing: {sp_struct}")
-        structs = load_pkl(sp_struct)
-        all_structs.extend(structs)
+def sorted_unique_ints(xs: List[int]) -> List[int]:
+    return sorted(list(set(int(x) for x in xs)))
 
-        sp_meta = os.path.join(DATA_DIR, f"meta_{sp}.pkl")
-        if os.path.exists(sp_meta):
-            metas = load_pkl(sp_meta)
-            if len(metas) == len(structs):
-                all_metas.extend(metas)
-            else:
-                # keep alignment simple: if mismatch, skip meta
-                all_metas = []
+def list_to_wrapped_str(items: List[str], sep="，", max_per_line=20) -> str:
+    # For Chinese report readability
+    lines = []
+    for i in range(0, len(items), max_per_line):
+        lines.append(sep.join(items[i:i+max_per_line]))
+    return "\n".join(lines)
 
-    N = len(all_structs)
 
-    # stats containers
-    materials = set()
-    thk_values = set()
-    mat2thk = defaultdict(list)
+# =========================
+# Core summarize
+# =========================
+def summarize_split(split: str) -> Dict[str, Any]:
+    struct_path = os.path.join(DATA_DIR, f"Structure_{split}.pkl")
+    spec_path   = os.path.join(DATA_DIR, f"Spectrum_{split}.pkl")
+    meta_path   = os.path.join(DATA_DIR, f"meta_{split}.pkl")
 
-    head_pairs_cnt = Counter()
-    adj_pairs_cnt = Counter()
-    type_cnt = Counter()
+    if not (os.path.exists(struct_path) and os.path.exists(spec_path)):
+        raise FileNotFoundError(f"Missing files for split={split} in {DATA_DIR}")
+
+    structs = load_pkl(struct_path)
+    specs = np.asarray(load_pkl(spec_path), dtype=np.float32)
+
+    metas = None
+    if os.path.exists(meta_path):
+        try:
+            metas = load_pkl(meta_path)
+            if len(metas) != len(structs):
+                metas = None
+        except Exception:
+            metas = None
+
+    assert len(structs) == specs.shape[0], f"{split}: len(struct) != len(spec)"
+    n = len(structs)
+
+    # Slice specs
+    specs_s = np.stack([slice_spec(specs[i], PLOT_MODE) for i in range(n)], axis=0)
+    dim = specs_s.shape[1]
+
+    # Wavelengths
+    if PLOT_MODE.upper() == "R_T":
+        if dim % 2 != 0:
+            raise ValueError("R_T mode expects even dim (R+T).")
+        W = dim // 2
+        wl = np.linspace(LAMBDA0, LAMBDA1, int(round((LAMBDA1 - LAMBDA0) / STEP_UM)) + 1)
+        if len(wl) != W:
+            wl = np.linspace(LAMBDA0, LAMBDA1, W)
+    else:
+        wl = np.linspace(LAMBDA0, LAMBDA1, int(round((LAMBDA1 - LAMBDA0) / STEP_UM)) + 1)
+        if len(wl) != dim:
+            wl = np.linspace(LAMBDA0, LAMBDA1, dim)
+
+    # Stats
+    mat_set = set()
+    mat_thks = defaultdict(list)     # mat -> thickness values (all occurrences)
+    mat_thk_set = defaultdict(set)   # mat -> unique thickness values
+    all_thk_set = set()
+
+    head_pair_cnt = Counter()
+    adj_pair_cnt = Counter()
+
     lens = []
+    type_cnt = Counter()
 
-    for i, toks in enumerate(all_structs):
+    for i, toks in enumerate(structs):
         lens.append(len(toks))
 
-        # meta types (optional)
-        if all_metas:
-            t = safe_meta_type(all_metas[i])
-            if t is not None:
-                type_cnt[t] += 1
+        if metas is not None and isinstance(metas[i], dict) and "type" in metas[i]:
+            type_cnt[metas[i]["type"]] += 1
 
-        head_pairs_cnt[head_pair(toks)] += 1
+        head_pair_cnt[head_pair(toks)] += 1
         for p in adjacent_pairs(toks):
-            adj_pairs_cnt[p] += 1
+            adj_pair_cnt[p] += 1
 
         for tok in toks:
             m, th = parse_token(tok)
             if m is None:
                 continue
-            materials.add(m)
+            mat_set.add(m)
             if th is not None:
-                thk_values.add(th)
-                mat2thk[m].append(th)
+                mat_thks[m].append(th)
+                mat_thk_set[m].add(th)
+                all_thk_set.add(th)
 
-    # material thickness ranges
-    mat_ranges = {}
-    for m, arr in mat2thk.items():
-        a = np.asarray(arr, dtype=np.int32)
-        mat_ranges[m] = {
-            "min": int(a.min()),
-            "max": int(a.max()),
-            "unique_count": int(len(set(a.tolist()))),
-        }
+    lens_np = np.asarray(lens, dtype=np.int64)
 
-    lens_np = np.asarray(lens, dtype=np.int32)
-    len_stats = {
-        "min": int(lens_np.min()),
-        "mean": float(lens_np.mean()),
-        "max": int(lens_np.max()),
-        "p50": float(np.percentile(lens_np, 50)),
-        "p90": float(np.percentile(lens_np, 90)),
-        "p95": float(np.percentile(lens_np, 95)),
+    # Sample curves for overlay
+    rng = np.random.default_rng(RANDOM_SEED + (0 if split == "train" else 1))
+    sample_ids = safe_sample_indices(n, MAX_CURVES_PER_SPLIT, rng)
+    curves_sample = specs_s[sample_ids]
+    np.save(os.path.join(OUT_DIR, f"curves_sample_{split}_{PLOT_MODE}.npy"), curves_sample)
+
+    out = {
+        "split": split,
+        "num_samples": int(n),
+        "spec_dim_after_slice": int(dim),
+        "plot_mode": PLOT_MODE,
+        "materials": sorted(list(mat_set)),
+        "num_materials": int(len(mat_set)),
+        "type_distribution": dict(type_cnt) if type_cnt else None,
+        "length_stats": {
+            "min": int(lens_np.min()),
+            "mean": float(lens_np.mean()),
+            "max": int(lens_np.max()),
+            "p50": float(np.percentile(lens_np, 50)),
+            "p90": float(np.percentile(lens_np, 90)),
+            "p95": float(np.percentile(lens_np, 95)),
+        },
+        "thickness_values_global": sorted_unique_ints(list(all_thk_set)),
+        "thickness_values_by_material": {m: sorted_unique_ints(list(mat_thk_set[m])) for m in sorted(mat_set)},
+        "head_pair_distribution": head_pair_cnt.most_common(),      # full list
+        "adjacent_pair_distribution": adj_pair_cnt.most_common(),   # full list
+        "_curves_sample_path": os.path.join(OUT_DIR, f"curves_sample_{split}_{PLOT_MODE}.npy"),
+    }
+    return out, curves_sample, wl
+
+
+def make_report_block(train_sum: Dict[str, Any], dev_sum: Dict[str, Any],
+                      global_materials: List[str],
+                      global_head_pairs: List[Tuple[str, int]],
+                      global_adj_pairs: List[Tuple[str, int]],
+                      global_thk_values: List[int],
+                      thk_values_by_mat: Dict[str, List[int]]) -> str:
+    """
+    A single block you can paste into your report.
+    """
+    lines = []
+    lines.append("【数据集统计汇总（Train+Dev）】")
+    lines.append(f"- Split 使用：train + dev（不含 test）")
+    lines.append(f"- Train 样本数：{train_sum['num_samples']}；Dev 样本数：{dev_sum['num_samples']}；总计：{train_sum['num_samples'] + dev_sum['num_samples']}")
+    lines.append("")
+
+    # Materials
+    lines.append(f"1）材料种类：{len(global_materials)}")
+    lines.append("材料列表：")
+    lines.append(list_to_wrapped_str(global_materials, sep="，", max_per_line=18))
+    lines.append("")
+
+    # Pairs (detailed list requested)
+    lines.append(f"2）组合种类（材料对）")
+    lines.append(f"- Head pair（首两层材料对）种类数：{len(global_head_pairs)}")
+    lines.append(f"- Adjacent pair（相邻层材料对）种类数：{len(global_adj_pairs)}")
+    lines.append("")
+    lines.append("Head pair 详细列表（pair: count）：")
+    for k, v in global_head_pairs[:REPORT_MAX_LIST]:
+        lines.append(f"  - {k}: {v}")
+    lines.append("")
+    lines.append("Adjacent pair 详细列表（pair: count）：")
+    for k, v in global_adj_pairs[:REPORT_MAX_LIST]:
+        lines.append(f"  - {k}: {v}")
+    lines.append("")
+
+    # Thickness
+    lines.append("3）厚度离散取值（Thickness values）")
+    lines.append(f"- 全局厚度档位数：{len(global_thk_values)}")
+    lines.append(f"- 全局厚度档位（nm）：{global_thk_values}")
+    lines.append("")
+    lines.append("各材料出现过的厚度档位（nm）：")
+    for m in global_materials:
+        vals = thk_values_by_mat.get(m, [])
+        lines.append(f"  - {m}（{len(vals)}档）：{vals}")
+    lines.append("")
+
+    # Length stats
+    lines.append("4）序列长度（layer 数）统计")
+    lines.append(f"- Train: {train_sum['length_stats']}")
+    lines.append(f"- Dev  : {dev_sum['length_stats']}")
+    lines.append("")
+
+    # Type distribution if present
+    if train_sum.get("type_distribution") is not None or dev_sum.get("type_distribution") is not None:
+        lines.append("5）类型分布（若 meta 存在）")
+        lines.append(f"- Train: {train_sum.get('type_distribution')}")
+        lines.append(f"- Dev  : {dev_sum.get('type_distribution')}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def main():
+    # Only train + dev
+    splits = ["train", "dev"]
+
+    summaries = {}
+    curve_bank = {}
+    wavelengths_ref = None
+
+    for sp in splits:
+        s, curves_sample, wl = summarize_split(sp)
+        summaries[sp] = s
+        curve_bank[sp] = curves_sample
+        if wavelengths_ref is None:
+            wavelengths_ref = wl
+
+    # Global unions across train+dev
+    global_materials = sorted(list(set(summaries["train"]["materials"]).union(set(summaries["dev"]["materials"]))))
+
+    # Merge pair counts (use full distributions)
+    head_cnt = Counter()
+    adj_cnt = Counter()
+    for sp in splits:
+        for k, v in summaries[sp]["head_pair_distribution"]:
+            head_cnt[k] += int(v)
+        for k, v in summaries[sp]["adjacent_pair_distribution"]:
+            adj_cnt[k] += int(v)
+
+    global_head_pairs = head_cnt.most_common()
+    global_adj_pairs = adj_cnt.most_common()
+
+    # Thickness union + per material union
+    global_thk_values = sorted(list(set(summaries["train"]["thickness_values_global"]).union(
+        set(summaries["dev"]["thickness_values_global"])
+    )))
+
+    thk_values_by_mat = {}
+    for m in global_materials:
+        vals = set()
+        vals.update(summaries["train"]["thickness_values_by_material"].get(m, []))
+        vals.update(summaries["dev"]["thickness_values_by_material"].get(m, []))
+        thk_values_by_mat[m] = sorted(list(vals))
+
+    # Overview json
+    overview = {
+        "data_dir": DATA_DIR,
+        "splits_used": splits,
+        "plot_mode": PLOT_MODE,
+        "max_curves_per_split": MAX_CURVES_PER_SPLIT,
+        "num_materials_union": len(global_materials),
+        "materials_union": global_materials,
+        "num_head_pair_types": len(global_head_pairs),
+        "num_adjacent_pair_types": len(global_adj_pairs),
+        "thickness_values_global": global_thk_values,
     }
 
-    # Prepare report text
-    mats_sorted = sorted(materials)
-    thk_sorted = sorted(thk_values)
-    num_pairs_adj = len(adj_pairs_cnt)
-    num_pairs_head = len(head_pairs_cnt)
+    # Save json
+    out_json = os.path.join(OUT_DIR, "summary.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump({"overview": overview, "by_split": summaries}, f, ensure_ascii=False, indent=2)
 
-    # type ratio text
-    type_text = ""
-    if type_cnt:
-        total_t = sum(type_cnt.values())
-        parts = [f"{k}:{v}({v/total_t:.1%})" for k, v in type_cnt.most_common()]
-        type_text = "；".join(parts)
-
-    # Print (copy-paste friendly)
-    print("\n==================== REPORT SUMMARY (TRAIN+DEV) ====================")
-    print(f"数据规模（train+dev）: {N}")
-    if type_text:
-        print(f"结构类型分布: {type_text}")
-
-    print(f"\n材料种类（num_materials）: {len(mats_sorted)}")
-    if SHOW_MATERIAL_LIST:
-        print("材料列表: " + ", ".join(mats_sorted))
-
-    print(f"\n厚度离散取值（unique thickness values）: {len(thk_sorted)} 种")
-    if thk_sorted:
-        print(f"厚度范围: [{thk_sorted[0]}, {thk_sorted[-1]}] nm")
-    if SHOW_THK_VALUES:
-        if len(thk_sorted) <= MAX_THK_VALUES_PRINT:
-            print("厚度取值集合(nm): " + ", ".join(map(str, thk_sorted)))
-        else:
-            head = thk_sorted[:MAX_THK_VALUES_PRINT//2]
-            tail = thk_sorted[-MAX_THK_VALUES_PRINT//2:]
-            print("厚度取值集合(nm): " + ", ".join(map(str, head)) + " ... " + ", ".join(map(str, tail)))
-            print(f"(太多了，只展示前后各 {MAX_THK_VALUES_PRINT//2} 个)")
-
-    print("\n每种材料厚度范围（min~max, unique_count）:")
-    for m in mats_sorted:
-        if m in mat_ranges:
-            r = mat_ranges[m]
-            print(f"  - {m:10s}: {r['min']:4d} ~ {r['max']:4d} nm  | unique_thk={r['unique_count']}")
-        else:
-            print(f"  - {m:10s}: (no thickness parsed)")
-
-    print(f"\n组合种类（材料对）统计：")
-    print(f"  - 相邻层材料对（adjacent pairs）种类数: {num_pairs_adj}")
-    print(f"  - 首两层材料对（head pairs）种类数: {num_pairs_head}")
-
-    print(f"\nTop-{TOPK} 相邻层材料对（adjacent pairs）:")
-    total_adj = sum(adj_pairs_cnt.values()) if adj_pairs_cnt else 1
-    for k, v in adj_pairs_cnt.most_common(TOPK):
-        print(f"  {k:18s} {v:8d} ({v/total_adj:.1%})")
-
-    print(f"\nTop-{TOPK} 首两层材料对（head pairs）:")
-    total_head = sum(head_pairs_cnt.values()) if head_pairs_cnt else 1
-    for k, v in head_pairs_cnt.most_common(TOPK):
-        print(f"  {k:18s} {v:8d} ({v/total_head:.1%})")
-
-    print("\n序列长度统计（#layers）:")
-    print(f"  min={len_stats['min']}  mean={len_stats['mean']:.3f}  max={len_stats['max']}")
-    print(f"  p50={len_stats['p50']:.1f}  p90={len_stats['p90']:.1f}  p95={len_stats['p95']:.1f}")
-
-    # Also save a small txt you can attach to report
-    out_txt = os.path.join(DATA_DIR, "_report_summary_train_dev.txt")
+    # Save txt (human-friendly)
+    out_txt = os.path.join(OUT_DIR, "summary.txt")
     with open(out_txt, "w", encoding="utf-8") as f:
-        # dump same content
-        import sys
-        # quick trick: regenerate via prints to file (simple + robust)
-        # We'll just write key sections
-        f.write(f"数据规模（train+dev）: {N}\n")
-        if type_text:
-            f.write(f"结构类型分布: {type_text}\n")
-        f.write(f"\n材料种类: {len(mats_sorted)}\n")
-        f.write("材料列表: " + ", ".join(mats_sorted) + "\n")
-        f.write(f"\n厚度离散取值: {len(thk_sorted)} 种\n")
-        if thk_sorted:
-            f.write(f"厚度范围: [{thk_sorted[0]}, {thk_sorted[-1]}] nm\n")
-        if len(thk_sorted) <= 500:
-            f.write("厚度取值集合(nm): " + ", ".join(map(str, thk_sorted)) + "\n")
-        else:
-            f.write("厚度取值集合(nm): (too many, see console)\n")
+        f.write(f"DATA_DIR: {DATA_DIR}\n")
+        f.write(f"SPLITS_USED: {splits}\n")
+        f.write(f"PLOT_MODE: {PLOT_MODE}\n")
+        f.write(f"MAX_CURVES_PER_SPLIT: {MAX_CURVES_PER_SPLIT}\n\n")
 
-        f.write("\n每种材料厚度范围:\n")
-        for m in mats_sorted:
-            if m in mat_ranges:
-                r = mat_ranges[m]
-                f.write(f"  - {m}: {r['min']}~{r['max']} nm | unique_thk={r['unique_count']}\n")
+        for sp in splits:
+            s = summaries[sp]
+            f.write(f"== SPLIT: {sp} ==\n")
+            f.write(f"num_samples: {s['num_samples']}\n")
+            if s["type_distribution"] is not None:
+                f.write(f"type_distribution: {s['type_distribution']}\n")
+            f.write(f"length_stats: {s['length_stats']}\n")
+            f.write(f"num_materials: {s['num_materials']}\n")
+            f.write(f"materials: {s['materials']}\n")
+            f.write(f"global_thickness_values(nm): {s['thickness_values_global']}\n")
+            f.write(f"head_pair_types: {len(s['head_pair_distribution'])}\n")
+            f.write(f"adjacent_pair_types: {len(s['adjacent_pair_distribution'])}\n\n")
 
-        f.write(f"\n相邻层材料对种类数: {num_pairs_adj}\n")
-        f.write(f"首两层材料对种类数: {num_pairs_head}\n")
+        f.write("== UNION (train+dev) ==\n")
+        f.write(f"num_materials_union: {len(global_materials)}\n")
+        f.write(f"materials_union: {global_materials}\n")
+        f.write(f"num_head_pair_types_union: {len(global_head_pairs)}\n")
+        f.write(f"num_adjacent_pair_types_union: {len(global_adj_pairs)}\n")
+        f.write(f"thickness_values_global_union(nm): {global_thk_values}\n")
 
-        f.write(f"\nTop-{TOPK} adjacent pairs:\n")
-        for k, v in adj_pairs_cnt.most_common(TOPK):
-            f.write(f"  {k} {v}\n")
+    # ============ REPORT BLOCK print ============
+    report_block = make_report_block(
+        train_sum=summaries["train"],
+        dev_sum=summaries["dev"],
+        global_materials=global_materials,
+        global_head_pairs=global_head_pairs,
+        global_adj_pairs=global_adj_pairs,
+        global_thk_values=global_thk_values,
+        thk_values_by_mat=thk_values_by_mat,
+    )
 
-        f.write(f"\nTop-{TOPK} head pairs:\n")
-        for k, v in head_pairs_cnt.most_common(TOPK):
-            f.write(f"  {k} {v}\n")
+    # Also save report block as a separate file for convenience
+    out_report = os.path.join(OUT_DIR, "report_block.txt")
+    with open(out_report, "w", encoding="utf-8") as f:
+        f.write(report_block + "\n")
 
-        f.write("\n序列长度统计:\n")
-        f.write(f"  min={len_stats['min']} mean={len_stats['mean']:.3f} max={len_stats['max']}\n")
-        f.write(f"  p50={len_stats['p50']:.1f} p90={len_stats['p90']:.1f} p95={len_stats['p95']:.1f}\n")
+    print(report_block)
+    print("\n[Saved report block] ->", out_report)
 
-    print(f"\n[Saved] {out_txt}")
-    print("=====================================================================\n")
+    # ============ Plot overlays ============
+    curves_all = np.concatenate([curve_bank["train"], curve_bank["dev"]], axis=0)
+
+    if PLOT_MODE.upper() == "R_T":
+        dim = curves_all.shape[1]
+        if dim % 2 != 0:
+            raise ValueError("R_T mode expects even dim (R+T).")
+        W = dim // 2
+        wl = wavelengths_ref
+        if wl is None or len(wl) != W:
+            wl = np.linspace(LAMBDA0, LAMBDA1, W)
+
+        out_r = os.path.join(OUT_DIR, "curves_overlay_R.png")
+        out_t = os.path.join(OUT_DIR, "curves_overlay_T.png")
+        plot_overlay(curves_all[:, :W], wl, f"Overlay curves (R) | sampled={curves_all.shape[0]} | train+dev", out_r)
+        plot_overlay(curves_all[:, W:], wl, f"Overlay curves (T) | sampled={curves_all.shape[0]} | train+dev", out_t)
+    else:
+        wl = wavelengths_ref
+        if wl is None:
+            wl = np.linspace(LAMBDA0, LAMBDA1, curves_all.shape[1])
+        out_png = os.path.join(OUT_DIR, f"curves_overlay_{PLOT_MODE}.png")
+        plot_overlay(curves_all, wl, f"Overlay curves ({PLOT_MODE}) | sampled={curves_all.shape[0]} | train+dev", out_png)
+
+    print("\nDone.")
+    print("Saved:")
+    print("  summary.json     ->", out_json)
+    print("  summary.txt      ->", out_txt)
+    print("  report_block.txt ->", out_report)
+    print("  plots / samples  ->", OUT_DIR)
 
 
 if __name__ == "__main__":
