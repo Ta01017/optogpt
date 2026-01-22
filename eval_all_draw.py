@@ -954,7 +954,7 @@ python eval_all.py \
   --tmm_batch 256 \
   --plot_mean_by_type \
   --plot_mean_by_layers \
-  --out_dir ./eval_curves_allnew \
+  --out_dir ./eval_curves_all_new_with_pic \
   --plot_min_count 20 \
   --plot_max_groups 50 \
   --save_curve_csv \

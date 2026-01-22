@@ -1,265 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-generate_dbr_small_token_30k_tmm_fast_batch_with_validation.py
-
-- 用你安装的 tmm_fast（导出 coh_tmm / inc_tmm）替代 tmm
-- 向量化：
-  * 波长维度：一次性算完整 wavelength 网格
-  * 样本维度：batch 计算（一次算 B 个结构）
-- 生成 DBR 数据集（Structure/Spectrum），结构 token 数量很小：
-  * 不使用随机厚度扰动
-  * 厚度只来源于少量中心波长 lambda0 的 quarter-wave 厚度
-  * token 仍然为 "Material_ThicknessNm"，但每种材料只有 ~len(LAMBDA0_SET) 种厚度
-
-- 内置验证（强烈建议先开验证再跑满 30k）：
-  1) tmm_fast vs tmm（参考逐波长 coh_tmm）数值一致性：max|dR|/RMSE 等
-  2) DBR 行为 sanity：R(lambda0)、stopband 宽度估计
-  3) 能量守恒 sanity：R+T <= 1 (+eps)
-
-输出：
-OUT_DIR/
-  Structure_train.pkl
-  Spectrum_train.pkl
-  Structure_dev.pkl
-  Spectrum_dev.pkl
-  meta_train.pkl
-  meta_dev.pkl
-
-Spectrum 每条为 [R..., T...]，波长网格：0.9~1.7 um, step=0.005
-"""
-
-import os
-import random
-import pickle as pkl
-from collections import Counter
-from typing import Dict, List, Tuple
-
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from scipy.interpolate import interp1d
-
-import torch
-import tmm_fast  # 你这个版本导出：coh_tmm / inc_tmm / plot_stacks
-from tmm import coh_tmm as coh_tmm_ref  # 用于验证（逐波长参考实现）
-
-
-# =========================
-# 0) 配置
-# =========================
-NUM_SAMPLES = 30000
-
-PAIR_MIN = 6
-PAIR_MAX = 10
-
-# 波长网格（与你原代码一致）
-WAVELENGTHS_UM = np.linspace(0.9, 1.7, int(round((1.7 - 0.9) / 0.005)) + 1)
-
-# 少量中心波长 lambda0（决定厚度 token 数量）
-LAMBDA0_SET_UM = [0.95, 1.05, 1.20, 1.31, 1.55, 1.65]
-
-NK_DIR = "./dataset/data"
-OUT_DIR = "./dataset/dbr_smalltoken_gpu"
-os.makedirs(OUT_DIR, exist_ok=True)
-
-TRAIN_RATIO = 0.8
-SPLIT_SEED = 42
-GLOBAL_SEED = 42
-
-# tmm_fast 基于 torch，支持 GPU
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# batch 大小（一次算多少个结构）
-BATCH_SIZE = 128 if torch.cuda.is_available() else 32
-
-# dtype
-COMPLEX_DTYPE = torch.complex64
-REAL_DTYPE = torch.float32
-
-
-# =========================
-# 1) 业内常用材料对
-# =========================
-INDUSTRY_CORE: List[Tuple[str, str]] = [
-    ("TiO2", "SiO2"),
-    ("Ta2O5", "SiO2"),
-    ("HfO2", "SiO2"),
-    ("Nb2O5", "SiO2"),
-    ("Si3N4", "SiO2"),
-    ("AlN", "SiO2"),
-]
-
-
-# =========================
-# 2) 加载 nk（wl,n,k csv -> 插值到 WAVELENGTHS_UM）
-#    转 torch，放 DEVICE
-# =========================
-def load_nk_torch(materials: List[str], wavelengths_um: np.ndarray) -> Dict[str, torch.Tensor]:
-    nk: Dict[str, torch.Tensor] = {}
-    for mat in materials:
-        path = os.path.join(NK_DIR, f"{mat}.csv")
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Missing nk csv for material: {mat} | expected: {path}")
-
-        df = pd.read_csv(path).dropna()
-        wl = df["wl"].values.astype(np.float64)
-        n = df["n"].values.astype(np.float64)
-        k = df["k"].values.astype(np.float64)
-
-        n_interp = interp1d(wl, n, bounds_error=False, fill_value="extrapolate")
-        k_interp = interp1d(wl, k, bounds_error=False, fill_value="extrapolate")
-
-        nk_np = n_interp(wavelengths_um) + 1j * k_interp(wavelengths_um)
-        nk_t = torch.tensor(nk_np, dtype=COMPLEX_DTYPE, device=DEVICE)
-        nk[mat] = nk_t
-    return nk
-
-
-# =========================
-# 3) 预计算离散厚度表（quarter-wave）
-# =========================
-def precompute_qw_thickness_table(
-    nk_dict_torch: Dict[str, torch.Tensor],
-    wavelengths_um: np.ndarray,
-    lambda0_set_um: List[float],
-) -> Dict[str, Dict[int, int]]:
-    wl = wavelengths_um
-    thk_table: Dict[str, Dict[int, int]] = {}
-    for mat, nk_arr_t in nk_dict_torch.items():
-        thk_table[mat] = {}
-        nk_arr = nk_arr_t.detach().cpu().numpy()
-        for lam0 in lambda0_set_um:
-            idx0 = int(np.argmin(np.abs(wl - lam0)))
-            n0 = float(np.real(nk_arr[idx0]))
-            t_nm = lam0 * 1000.0 / (4.0 * n0)
-            t_nm_int = int(round(t_nm))
-            thk_table[mat][int(round(lam0 * 1000))] = t_nm_int
-    return thk_table
-
-
-# =========================
-# 4) 生成一个 DBR（离散厚度）
-# =========================
-def generate_dbr_discrete(
-    industry_pairs: List[Tuple[str, str]],
-    thk_table: Dict[str, Dict[int, int]],
-) -> Tuple[List[str], List[int], dict]:
-    H, L = random.choice(industry_pairs)
-    lambda0_um = random.choice(LAMBDA0_SET_UM)
-    lambda0_nm = int(round(lambda0_um * 1000))
-    pairs = random.randint(PAIR_MIN, PAIR_MAX)
-
-    materials, thicknesses = [], []
-    for i in range(pairs * 2):
-        mat = H if (i % 2 == 0) else L
-        t_nm = thk_table[mat][lambda0_nm]
-        materials.append(mat)
-        thicknesses.append(t_nm)
-
-    meta = dict(
-        pair_H=H,
-        pair_L=L,
-        pair_name=f"{H}/{L}",
-        lambda0_um=float(lambda0_um),
-        lambda0_nm=int(lambda0_nm),
-        pairs=int(pairs),
-        num_layers=int(pairs * 2),
-        mode="discrete_qw",
-    )
-    return materials, thicknesses, meta
-
-
-# =========================
-# 5) batch 打包：pad 到 batch 内最大层数
-# =========================
-def pack_batch_to_tmm_inputs(
-    batch_mats: List[List[str]],
-    batch_thks_nm: List[List[int]],
-    nk_dict_torch: Dict[str, torch.Tensor],
-    wl_m: torch.Tensor,  # [num_wl]
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    返回:
-      n: [B, Lmax+2, num_wl] complex
-      d: [B, Lmax+2] real (meters, with inf at ends)
-    """
-    B = len(batch_mats)
-    num_wl = wl_m.shape[0]
-    Lmax = max(len(x) for x in batch_mats)
-
-    d = torch.zeros((B, Lmax + 2), dtype=REAL_DTYPE, device=DEVICE)
-    d[:, 0] = float("inf")
-    d[:, -1] = float("inf")
-
-    n = torch.empty((B, Lmax + 2, num_wl), dtype=COMPLEX_DTYPE, device=DEVICE)
-    n[:, 0, :] = (1.0 + 0.0j)
-    n[:, -1, :] = (1.0 + 0.0j)
-
-    for bi in range(B):
-        mats = batch_mats[bi]
-        thks = batch_thks_nm[bi]
-        L = len(mats)
-
-        d[bi, 1:1 + L] = torch.tensor(thks, dtype=REAL_DTYPE, device=DEVICE) * 1e-9  # nm -> m
-        for li, m in enumerate(mats, start=1):
-            n[bi, li, :] = nk_dict_torch[m]
-
-        if L < Lmax:
-            # pad 层：厚度=0；n 复制最后一层（也可以设 1.0）
-            n_pad_val = n[bi, L, :].clone()  # 注意：L 层对应索引 L（因为前面有入射介质）
-            n[bi, 1 + L:1 + Lmax, :] = n_pad_val
-
-    return n, d
-
-
-# =========================
-# 6) tmm_fast batch 计算（波长 + 样本向量化）
-# =========================
-def calc_RT_fast_batch(
-    batch_mats: List[List[str]],
-    batch_thks_nm: List[List[int]],
-    nk_dict_torch: Dict[str, torch.Tensor],
-    wl_m: torch.Tensor,       # [num_wl], meters
-    theta_rad: torch.Tensor,  # [A]
-    pol: str = "s",
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    返回:
-      R: [B, num_wl] float32 numpy
-      T: [B, num_wl] float32 numpy
-    """
-    n, d = pack_batch_to_tmm_inputs(batch_mats, batch_thks_nm, nk_dict_torch, wl_m)
-
-    # 你的 tmm_fast 版本导出 coh_tmm（色散、多 stack、向量化）
-    out = tmm_fast.coh_tmm(pol, n, d, theta_rad, wl_m)
-
-    R = out["R"]
-    T = out["T"]
-
-    # 统一到 [B, num_wl]
-    if R.ndim == 3:
-        R = R[:, 0, :]
-        T = T[:, 0, :]
-    elif R.ndim != 2:
-        raise RuntimeError(f"Unexpected R shape: {tuple(R.shape)}")
-
-    return (
-        R.detach().to("cpu").float().numpy(),
-        T.detach().to("cpu").float().numpy(),
-    )
-
-
-# =========================
-# 7) 保存 train/dev
-# =========================
-def save_split(struct_list, spec_list, meta_list, out_dir):
-    N = len(struct_list)
-    rng = np.random.default_rng(SPLIT_SEED)
-    idx = rng.permutation(N)
-    split = int(N * TRAIN_RATIO)
-    idx_train = idx[:split]
+p_train = idx[:split]
     idx_dev = idx[split:]
 
     train_struct = [struct_list[i] for i in idx_train]
@@ -370,11 +109,9 @@ def validate_dbr(
     """
     1) tmm_fast vs tmm（参考逐波长 coh_tmm）数值一致性
     2) DBR 行为 sanity：R(lambda0)、stopband 宽度估计
-    3) 能量守恒 sanity：R+T <= 1 + eps
+    3) 能量守恒 sanity：R+T <= 1 +eps
     """
     import matplotlib.pyplot as plt
-
-    rng = np.random.default_rng(seed)
 
     nk_dict_np = {k: v.detach().cpu().numpy() for k, v in nk_dict_torch.items()}
 
@@ -474,6 +211,99 @@ def validate_dbr(
 
 
 # =========================
+# 【新增】X) 绘图：单曲线 + 覆盖曲线
+# =========================
+def _ensure_plot_dirs(out_dir: str):
+    os.makedirs(os.path.join(out_dir, "plots_single"), exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "plots_overlay"), exist_ok=True)
+
+def plot_single_structure(wavelengths_um, R, T, meta, out_dir, idx):
+    """
+    单条曲线：R/T + lambda0
+    """
+    import matplotlib.pyplot as plt
+
+    _ensure_plot_dirs(out_dir)
+
+    plt.figure(figsize=(7, 4.2))
+    plt.plot(wavelengths_um, R, label="R")
+    plt.plot(wavelengths_um, T, label="T")
+    plt.axvline(meta["lambda0_um"], linestyle="--", color="gray", label="lambda0")
+
+    plt.ylim([-0.05, 1.05])
+    plt.xlabel("Wavelength (um)")
+    plt.ylabel("R / T")
+    plt.title(f"[{idx}] {meta['pair_name']} pairs={meta['pairs']}  λ0={meta['lambda0_um']:.3f}um")
+    plt.legend()
+    plt.tight_layout()
+
+    save_path = os.path.join(out_dir, "plots_single", f"single_{idx:06d}.png")
+    plt.savefig(save_path, dpi=160)
+    plt.close()
+
+def plot_overlay(wavelengths_um, R_list, meta_list, out_dir, batch_idx, K=10):
+    """
+    覆盖图：叠加多条 R(λ)，用于观察覆盖/多样性
+    """
+    import matplotlib.pyplot as plt
+
+    _ensure_plot_dirs(out_dir)
+
+    n = len(R_list)
+    K = min(K, n)
+    if K <= 0:
+        return
+    idxs = np.random.choice(n, K, replace=False)
+
+    plt.figure(figsize=(7, 4.2))
+    for i in idxs:
+        plt.plot(wavelengths_um, R_list[i], alpha=0.28)
+
+    plt.ylim([-0.05, 1.05])
+    plt.xlabel("Wavelength (um)")
+    plt.ylabel("Reflectance R")
+    plt.title(f"Overlay batch={batch_idx}  (K={K})")
+    plt.tight_layout()
+
+    save_path = os.path.join(out_dir, "plots_overlay", f"overlay_{batch_idx:06d}.png")
+    plt.savefig(save_path, dpi=160)
+    plt.close()
+
+def plot_global_overlay_from_saved(out_dir: str, wavelengths_um: np.ndarray, spec_list: List[list], K: int = 80):
+    """
+    生成结束后，从所有 spec 中随机抽 K 条画一张全局覆盖图
+    spec_list: 每条是 [R...,T...] 的 list
+    """
+    import matplotlib.pyplot as plt
+
+    _ensure_plot_dirs(out_dir)
+
+    n = len(spec_list)
+    if n == 0:
+        return
+    K = min(K, n)
+    idxs = np.random.choice(n, K, replace=False)
+
+    num_wl = len(wavelengths_um)
+
+    plt.figure(figsize=(7, 4.2))
+    for i in idxs:
+        spec = np.array(spec_list[i], dtype=np.float32)
+        R = spec[:num_wl]
+        plt.plot(wavelengths_um, R, alpha=0.18)
+
+    plt.ylim([-0.05, 1.05])
+    plt.xlabel("Wavelength (um)")
+    plt.ylabel("Reflectance R")
+    plt.title(f"Global overlay (random {K} / {n})")
+    plt.tight_layout()
+
+    save_path = os.path.join(out_dir, "plots_overlay", f"overlay_global_{K}.png")
+    plt.savefig(save_path, dpi=180)
+    plt.close()
+
+
+# =========================
 # 9) 主流程
 # =========================
 def main():
@@ -511,7 +341,6 @@ def main():
         print(f"{m:8s} unique_thk={len(vals):2d}  values={vals}")
 
     # ==========（可选但强烈建议）先做验证 ==========
-    # 你可以先 num_checks=5，确认误差很小，再跑满 30k
     validate_dbr(
         nk_dict_torch=nk_dict_torch,
         wavelengths_um=WAVELENGTHS_UM,
@@ -526,7 +355,9 @@ def main():
     # ========== 生成数据 ==========
     struct_list, spec_list, meta_list = [], [], []
 
+    batch_counter = 0
     pbar = tqdm(total=NUM_SAMPLES, desc="Generating DBR small-token 30k (tmm_fast coh_tmm batch)")
+
     while len(struct_list) < NUM_SAMPLES:
         cur = min(BATCH_SIZE, NUM_SAMPLES - len(struct_list))
         batch_mats, batch_thks, batch_meta = [], [], []
@@ -546,6 +377,32 @@ def main():
             pol="s",
         )  # [cur, num_wl]
 
+        # ===== 【新增】绘图：单张 + 覆盖 =====
+        # 单张：概率触发（别太频繁，不然 IO 很慢）
+        if random.random() < PLOT_SINGLE_PROB:
+            plot_single_structure(
+                wavelengths_um=WAVELENGTHS_UM,
+                R=R_batch[0],
+                T=T_batch[0],
+                meta=batch_meta[0],
+                out_dir=OUT_DIR,
+                idx=len(struct_list),
+            )
+
+        # 覆盖图：每隔若干 batch 保存一次（建议 10/20）
+        if (batch_counter % PLOT_OVERLAY_EVERY_BATCH) == 0:
+            plot_overlay(
+                wavelengths_um=WAVELENGTHS_UM,
+                R_list=R_batch,
+                meta_list=batch_meta,
+                out_dir=OUT_DIR,
+                batch_idx=len(struct_list),
+                K=PLOT_OVERLAY_K,
+            )
+
+        batch_counter += 1
+        # ===== 结束绘图 =====
+
         for bi in range(cur):
             mats = batch_mats[bi]
             thks = batch_thks[bi]
@@ -564,6 +421,18 @@ def main():
 
     # 保存 train/dev
     save_split(struct_list, spec_list, meta_list, OUT_DIR)
+
+    # ===== 【新增】生成结束后：全局覆盖图 =====
+    try:
+        plot_global_overlay_from_saved(
+            out_dir=OUT_DIR,
+            wavelengths_um=WAVELENGTHS_UM,
+            spec_list=spec_list,
+            K=PLOT_GLOBAL_OVERLAY_K,
+        )
+        print(f"[Plot] Saved global overlay: plots_overlay/overlay_global_{min(PLOT_GLOBAL_OVERLAY_K, len(spec_list))}.png")
+    except Exception as e:
+        print("[Plot] Global overlay failed:", repr(e))
 
     # ========== 统计 ==========
     pair_cnt = Counter()
@@ -600,6 +469,8 @@ def main():
     print("approx total structure tokens (material_thk):", approx_vocab)
 
     print("\nDone. OUT_DIR =", OUT_DIR)
+    print(f"[Plot] single curves -> {os.path.join(OUT_DIR, 'plots_single')}")
+    print(f"[Plot] overlay curves -> {os.path.join(OUT_DIR, 'plots_overlay')}")
 
 
 if __name__ == "__main__":
