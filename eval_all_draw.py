@@ -9,7 +9,10 @@ eval_optogpt_universal_mae_tmmfast_full.py
 - Pred   MAE: greedy decode -> TMM_FAST -> spec_pred vs dev_spec
 - 打印若干样例：type/num_layers + gt/pred pair + head + oracle/pred mae
 - 输出整体 mae + by-type / by-num_layers bucket + pred pair/token 分布
-- 【新增】曲线差异验证：按 type / 层数 bucket 保存 GT/Oracle/Pred 的均值曲线 + 误差曲线（服务器可跑，不 show，只 save）
+- 【曲线差异验证】按 type / 层数 bucket 保存 GT/Oracle/Pred 的均值曲线 + 误差曲线（服务器可跑，不 show，只 save）
+- 【新增】在保存的曲线图上写入“代表曲线差异的指标”（Oracle vs GT / Pred vs GT）：
+    MAE / RMSE / MAX / Area|Δ| / Corr / PSNR
+  并可选保存 mean_signed_err 图（看系统性偏差）
 
 【重要：边界条件默认与生成器一致】
 POL="s"
@@ -25,6 +28,7 @@ FORCE_SUBSTRATE_K0=True  (substrate 半无限介质强制 k=0，避免 tmm_fast 
 """
 
 import os
+import json
 import argparse
 import random
 import pickle as pkl
@@ -338,6 +342,41 @@ def _sanitize_name(s: str) -> str:
     s = s.replace("|", "_").replace(",", "_").replace(";", "_")
     return s[:120]
 
+def _curve_metrics(y_hat: np.ndarray, y_gt: np.ndarray, x: np.ndarray) -> Dict[str, float]:
+    """Scalar metrics on 1D curve y(x)."""
+    y_hat = np.asarray(y_hat, dtype=np.float64)
+    y_gt  = np.asarray(y_gt, dtype=np.float64)
+    x     = np.asarray(x, dtype=np.float64)
+
+    d = y_hat - y_gt
+    mae = float(np.mean(np.abs(d)))
+    rmse = float(np.sqrt(np.mean(d * d)))
+    mx = float(np.max(np.abs(d)))
+
+    # integrate absolute error over wavelength
+    area = float(np.trapz(np.abs(d), x))
+
+    # correlation
+    if np.std(y_hat) < 1e-12 or np.std(y_gt) < 1e-12:
+        corr = float("nan")
+    else:
+        corr = float(np.corrcoef(y_hat, y_gt)[0, 1])
+
+    # PSNR with dynamic range from GT
+    y_min = float(np.min(y_gt))
+    y_max = float(np.max(y_gt))
+    dr = max(y_max - y_min, 1e-12)
+    psnr = float(20.0 * np.log10(dr) - 10.0 * np.log10(max(rmse * rmse, 1e-24)))
+
+    return {
+        "MAE": mae,
+        "RMSE": rmse,
+        "MAX": mx,
+        "AreaAbs": area,
+        "Corr": corr,
+        "PSNR": psnr,
+    }
+
 def _plot_curve_and_err(
     wavelengths_um: np.ndarray,
     gt_mean: np.ndarray,
@@ -348,47 +387,126 @@ def _plot_curve_and_err(
     title_prefix: str,
     ylabel: str,
     save_csv: bool = False,
+    save_signed_err: bool = True,
+    save_metrics_json: bool = True,
 ):
     _safe_makedirs(out_dir)
 
+    x = np.asarray(wavelengths_um, dtype=np.float64)
+    gt = np.asarray(gt_mean, dtype=np.float64)
+    oc = np.asarray(oracle_mean, dtype=np.float64)
+    pd = np.asarray(pred_mean, dtype=np.float64)
+
+    # ---- compute metrics (scalar) ----
+    m_oracle = _curve_metrics(oc, gt, x)
+    m_pred   = _curve_metrics(pd, gt, x)
+
+    def _fmt(m: Dict[str, float]) -> str:
+        return (
+            f"MAE={m['MAE']:.4g}\n"
+            f"RMSE={m['RMSE']:.4g}\n"
+            f"MAX={m['MAX']:.4g}\n"
+            f"Area|Δ|={m['AreaAbs']:.4g}\n"
+            f"Corr={m['Corr']:.4g}\n"
+            f"PSNR={m['PSNR']:.3g}"
+        )
+
+    txt = "Oracle vs GT\n" + _fmt(m_oracle) + "\n\nPred vs GT\n" + _fmt(m_pred)
+
+    # =========================
     # mean curves
+    # =========================
     plt.figure()
-    plt.plot(wavelengths_um, gt_mean, label="GT(dev_spec)")
-    plt.plot(wavelengths_um, oracle_mean, label="Oracle(TMM(gt))")
-    plt.plot(wavelengths_um, pred_mean, label="Pred(TMM(pred))")
+    plt.plot(x, gt, label="GT(dev_spec)")
+    plt.plot(x, oc, label="Oracle(TMM(gt))")
+    plt.plot(x, pd, label="Pred(TMM(pred))")
     plt.xlabel("Wavelength (um)")
     plt.ylabel(ylabel)
     plt.title(f"{title_prefix} - {group_name}")
     plt.legend()
+
+    plt.gca().text(
+        0.99, 0.99, txt,
+        transform=plt.gca().transAxes,
+        ha="right", va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round", alpha=0.85)
+    )
+
     plt.tight_layout()
     f1 = os.path.join(out_dir, f"mean_curve__{group_name}.png")
     plt.savefig(f1, dpi=200)
     plt.close()
 
+    # =========================
     # abs error curves
+    # =========================
+    abs_oc = np.abs(oc - gt)
+    abs_pd = np.abs(pd - gt)
+
     plt.figure()
-    plt.plot(wavelengths_um, np.abs(oracle_mean - gt_mean), label="|Oracle-GT|")
-    plt.plot(wavelengths_um, np.abs(pred_mean - gt_mean), label="|Pred-GT|")
+    plt.plot(x, abs_oc, label="|Oracle-GT|")
+    plt.plot(x, abs_pd, label="|Pred-GT|")
     plt.xlabel("Wavelength (um)")
     plt.ylabel(f"|Δ| ({ylabel})")
     plt.title(f"Mean Abs Error - {group_name}")
     plt.legend()
+
+    txt2 = (
+        f"Oracle: MAE={m_oracle['MAE']:.4g}, RMSE={m_oracle['RMSE']:.4g}, MAX={m_oracle['MAX']:.4g}, Area={m_oracle['AreaAbs']:.4g}\n"
+        f"Pred  : MAE={m_pred['MAE']:.4g}, RMSE={m_pred['RMSE']:.4g}, MAX={m_pred['MAX']:.4g}, Area={m_pred['AreaAbs']:.4g}"
+    )
+    plt.gca().text(
+        0.01, 0.99, txt2,
+        transform=plt.gca().transAxes,
+        ha="left", va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round", alpha=0.85)
+    )
+
     plt.tight_layout()
     f2 = os.path.join(out_dir, f"mean_abs_err__{group_name}.png")
     plt.savefig(f2, dpi=200)
     plt.close()
 
+    # =========================
+    # signed error curves (optional)
+    # =========================
+    if save_signed_err:
+        plt.figure()
+        plt.plot(x, (oc - gt), label="Oracle-GT")
+        plt.plot(x, (pd - gt), label="Pred-GT")
+        plt.axhline(0.0, linewidth=1)
+        plt.xlabel("Wavelength (um)")
+        plt.ylabel(f"Δ ({ylabel})")
+        plt.title(f"Mean Signed Error - {group_name}")
+        plt.legend()
+        plt.tight_layout()
+        f3 = os.path.join(out_dir, f"mean_signed_err__{group_name}.png")
+        plt.savefig(f3, dpi=200)
+        plt.close()
+
+    # =========================
+    # CSV + metrics json (optional)
+    # =========================
     if save_csv:
         csv_path = os.path.join(out_dir, f"mean_curve__{group_name}.csv")
         df = pd.DataFrame({
-            "wavelength_um": wavelengths_um,
-            "gt_mean": gt_mean,
-            "oracle_mean": oracle_mean,
-            "pred_mean": pred_mean,
-            "abs_err_oracle": np.abs(oracle_mean - gt_mean),
-            "abs_err_pred": np.abs(pred_mean - gt_mean),
+            "wavelength_um": x,
+            "gt_mean": gt,
+            "oracle_mean": oc,
+            "pred_mean": pd,
+            "abs_err_oracle": np.abs(oc - gt),
+            "abs_err_pred": np.abs(pd - gt),
+            "signed_err_oracle": (oc - gt),
+            "signed_err_pred": (pd - gt),
         })
         df.to_csv(csv_path, index=False)
+
+    if save_metrics_json:
+        metrics_path = os.path.join(out_dir, f"metrics__{group_name}.json")
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump({"oracle_vs_gt": m_oracle, "pred_vs_gt": m_pred}, f, ensure_ascii=False, indent=2)
 
 def _plot_groups_mean_curves(
     wavelengths_um: np.ndarray,
@@ -402,6 +520,8 @@ def _plot_groups_mean_curves(
     plot_max_groups: int,
     save_csv: bool,
     spec_type: str,
+    save_signed_err: bool,
+    save_metrics_json: bool,
 ):
     """
     自动处理 spec_type:
@@ -446,6 +566,8 @@ def _plot_groups_mean_curves(
                 title_prefix=f"Mean Curve ({st})",
                 ylabel=st,
                 save_csv=save_csv,
+                save_signed_err=save_signed_err,
+                save_metrics_json=save_metrics_json,
             )
         elif st == "R_T":
             W = wavelengths_um.shape[0]
@@ -462,6 +584,8 @@ def _plot_groups_mean_curves(
                 title_prefix="Mean Curve (R)",
                 ylabel="R",
                 save_csv=save_csv,
+                save_signed_err=save_signed_err,
+                save_metrics_json=save_metrics_json,
             )
             # T
             _plot_curve_and_err(
@@ -474,6 +598,8 @@ def _plot_groups_mean_curves(
                 title_prefix="Mean Curve (T)",
                 ylabel="T",
                 save_csv=save_csv,
+                save_signed_err=save_signed_err,
+                save_metrics_json=save_metrics_json,
             )
         else:
             raise ValueError(f"Unknown spec_type: {spec_type}")
@@ -505,12 +631,14 @@ def main():
     ap.add_argument("--tmm_batch", type=int, default=256)
 
     # ===== curve plot options =====
-    ap.add_argument("--out_dir", type=str, default="./eval_curves", help="Where to save curve pngs/csvs.")
+    ap.add_argument("--out_dir", type=str, default="./eval_curves", help="Where to save curve pngs/csvs/json.")
     ap.add_argument("--plot_mean_by_type", action="store_true", help="Save mean curves per type.")
     ap.add_argument("--plot_mean_by_layers", action="store_true", help="Save mean curves per layer-bucket.")
     ap.add_argument("--plot_max_groups", type=int, default=50, help="Max number of groups to plot (avoid too many files).")
     ap.add_argument("--plot_min_count", type=int, default=20, help="Only plot groups with >= this many samples.")
     ap.add_argument("--save_curve_csv", action="store_true", help="Also save mean curves to csv.")
+    ap.add_argument("--save_signed_err", action="store_true", help="Also save mean_signed_err png.")
+    ap.add_argument("--save_metrics_json", action="store_true", help="Also save per-plot metrics json.")
 
     args = ap.parse_args()
     set_seed(args.seed)
@@ -629,7 +757,6 @@ def main():
             for m in mats:
                 if m not in nk_dict_torch:
                     new_mats.add(m)
-        # substrate always needed if substrate exit
         if EXIT_MEDIUM == "substrate" and SUBSTRATE not in nk_dict_torch:
             new_mats.add(SUBSTRATE)
 
@@ -663,7 +790,6 @@ def main():
         mae = np.mean(np.abs(spec_gt - targets), axis=1)
         oracle_mae_list.extend(mae.tolist())
 
-        # store
         oracle_spec_list.extend(spec_gt.tolist())
         gt_spec_list.extend(targets.tolist())
 
@@ -678,7 +804,6 @@ def main():
         mae2 = np.mean(np.abs(spec_pd - targets2), axis=1)
         pred_mae_list.extend(mae2.tolist())
 
-        # store
         pred_spec_list.extend(spec_pd.tolist())
 
     oracle_mae = np.asarray(oracle_mae_list, dtype=np.float32)
@@ -769,6 +894,8 @@ def main():
                 plot_max_groups=args.plot_max_groups,
                 save_csv=args.save_curve_csv,
                 spec_type=args.spec_type,
+                save_signed_err=args.save_signed_err,
+                save_metrics_json=args.save_metrics_json,
             )
 
         if args.plot_mean_by_layers:
@@ -786,6 +913,8 @@ def main():
                 plot_max_groups=args.plot_max_groups,
                 save_csv=args.save_curve_csv,
                 spec_type=args.spec_type,
+                save_signed_err=args.save_signed_err,
+                save_metrics_json=args.save_metrics_json,
             )
 
     # -------------------------
@@ -828,5 +957,7 @@ python eval_all.py \
   --out_dir ./eval_curves_allnew \
   --plot_min_count 20 \
   --plot_max_groups 50 \
-  --save_curve_csv
+  --save_curve_csv \
+  --save_signed_err \
+  --save_metrics_json
 """
