@@ -1,4 +1,288 @@
-p_train = idx[:split]
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+generate_dbr_small_token_30k_tmm_fast_batch_with_validation.py
+
+- 用你安装的 tmm_fast（导出 coh_tmm / inc_tmm）替代 tmm
+- 向量化：
+  * 波长维度：一次性算完整 wavelength 网格
+  * 样本维度：batch 计算（一次算 B 个结构）
+- 生成 DBR 数据集（Structure/Spectrum），结构 token 数量很小：
+  * 不使用随机厚度扰动
+  * 厚度只来源于少量中心波长 lambda0 的 quarter-wave 厚度
+  * token 仍然为 "Material_ThicknessNm"，但每种材料只有 ~len(LAMBDA0_SET) 种厚度
+
+- 内置验证（强烈建议先开验证再跑满 30k）：
+  1) tmm_fast vs tmm（参考逐波长 coh_tmm）数值一致性：max|dR|/RMSE 等
+  2) DBR 行为 sanity：R(lambda0)、stopband 宽度估计
+  3) 能量守恒 sanity：R+T <= 1 (+eps)
+
+- 【新增绘图功能】
+  A) 单张曲线图：随机抽样若干样例，画 R/T + lambda0 竖线，用于肉眼判断 DBR 是否正常
+  B) 覆盖图：每隔若干 batch 抽 K 条曲线叠加，观察覆盖/多样性
+  C) 生成结束：再额外画一张全局覆盖图（从全数据随机抽 K 条）
+
+输出：
+OUT_DIR/
+  Structure_train.pkl
+  Spectrum_train.pkl
+  Structure_dev.pkl
+  Spectrum_dev.pkl
+  meta_train.pkl
+  meta_dev.pkl
+  plots_single/
+  plots_overlay/
+
+Spectrum 每条为 [R..., T...]，波长网格：0.9~1.7 um, step=0.005
+"""
+
+import os
+import random
+import pickle as pkl
+from collections import Counter
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from scipy.interpolate import interp1d
+
+import torch
+import tmm_fast  # 你这个版本导出：coh_tmm / inc_tmm / plot_stacks
+from tmm import coh_tmm as coh_tmm_ref  # 用于验证（逐波长参考实现）
+
+
+# =========================
+# 0) 配置
+# =========================
+NUM_SAMPLES = 30000
+
+PAIR_MIN = 6
+PAIR_MAX = 10
+
+# 波长网格（与你原代码一致）
+WAVELENGTHS_UM = np.linspace(0.9, 1.7, int(round((1.7 - 0.9) / 0.005)) + 1)
+
+# 少量中心波长 lambda0（决定厚度 token 数量）
+LAMBDA0_SET_UM = [0.95, 1.05, 1.20, 1.31, 1.55, 1.65]
+
+NK_DIR = "./dataset/data"
+OUT_DIR = "./dataset/dbr_smalltoken_gpu"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+TRAIN_RATIO = 0.8
+SPLIT_SEED = 42
+GLOBAL_SEED = 42
+
+# tmm_fast 基于 torch，支持 GPU
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# batch 大小（一次算多少个结构）
+BATCH_SIZE = 128 if torch.cuda.is_available() else 32
+
+# dtype
+COMPLEX_DTYPE = torch.complex64
+REAL_DTYPE = torch.float32
+
+# =========================
+# 【新增】绘图配置
+# =========================
+# 单张曲线：概率触发（例如 0.02 表示约 2% batch 画一张）
+PLOT_SINGLE_PROB = 0.02
+
+# 覆盖图：每隔多少个 batch 画一次（1 表示每个 batch 都画，建议 10 或 20）
+PLOT_OVERLAY_EVERY_BATCH = 10
+
+# 覆盖图每张叠加多少条曲线
+PLOT_OVERLAY_K = 12
+
+# 生成结束后全局再抽 K 条画一张总覆盖
+PLOT_GLOBAL_OVERLAY_K = 80
+
+
+# =========================
+# 1) 业内常用材料对
+# =========================
+INDUSTRY_CORE: List[Tuple[str, str]] = [
+    ("TiO2", "SiO2"),
+    ("Ta2O5", "SiO2"),
+    ("HfO2", "SiO2"),
+    ("Nb2O5", "SiO2"),
+    ("Si3N4", "SiO2"),
+    ("AlN", "SiO2"),
+]
+
+
+# =========================
+# 2) 加载 nk（wl,n,k csv -> 插值到 WAVELENGTHS_UM）
+#    转 torch，放 DEVICE
+# =========================
+def load_nk_torch(materials: List[str], wavelengths_um: np.ndarray) -> Dict[str, torch.Tensor]:
+    nk: Dict[str, torch.Tensor] = {}
+    for mat in materials:
+        path = os.path.join(NK_DIR, f"{mat}.csv")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing nk csv for material: {mat} | expected: {path}")
+
+        df = pd.read_csv(path).dropna()
+        wl = df["wl"].values.astype(np.float64)
+        n = df["n"].values.astype(np.float64)
+        k = df["k"].values.astype(np.float64)
+
+        n_interp = interp1d(wl, n, bounds_error=False, fill_value="extrapolate")
+        k_interp = interp1d(wl, k, bounds_error=False, fill_value="extrapolate")
+
+        nk_np = n_interp(wavelengths_um) + 1j * k_interp(wavelengths_um)
+        nk_t = torch.tensor(nk_np, dtype=COMPLEX_DTYPE, device=DEVICE)
+        nk[mat] = nk_t
+    return nk
+
+
+# =========================
+# 3) 预计算离散厚度表（quarter-wave）
+# =========================
+def precompute_qw_thickness_table(
+    nk_dict_torch: Dict[str, torch.Tensor],
+    wavelengths_um: np.ndarray,
+    lambda0_set_um: List[float],
+) -> Dict[str, Dict[int, int]]:
+    wl = wavelengths_um
+    thk_table: Dict[str, Dict[int, int]] = {}
+    for mat, nk_arr_t in nk_dict_torch.items():
+        thk_table[mat] = {}
+        nk_arr = nk_arr_t.detach().cpu().numpy()
+        for lam0 in lambda0_set_um:
+            idx0 = int(np.argmin(np.abs(wl - lam0)))
+            n0 = float(np.real(nk_arr[idx0]))
+            t_nm = lam0 * 1000.0 / (4.0 * n0)
+            t_nm_int = int(round(t_nm))
+            thk_table[mat][int(round(lam0 * 1000))] = t_nm_int
+    return thk_table
+
+
+# =========================
+# 4) 生成一个 DBR（离散厚度）
+# =========================
+def generate_dbr_discrete(
+    industry_pairs: List[Tuple[str, str]],
+    thk_table: Dict[str, Dict[int, int]],
+) -> Tuple[List[str], List[int], dict]:
+    H, L = random.choice(industry_pairs)
+    lambda0_um = random.choice(LAMBDA0_SET_UM)
+    lambda0_nm = int(round(lambda0_um * 1000))
+    pairs = random.randint(PAIR_MIN, PAIR_MAX)
+
+    materials, thicknesses = [], []
+    for i in range(pairs * 2):
+        mat = H if (i % 2 == 0) else L
+        t_nm = thk_table[mat][lambda0_nm]
+        materials.append(mat)
+        thicknesses.append(t_nm)
+
+    meta = dict(
+        pair_H=H,
+        pair_L=L,
+        pair_name=f"{H}/{L}",
+        lambda0_um=float(lambda0_um),
+        lambda0_nm=int(lambda0_nm),
+        pairs=int(pairs),
+        num_layers=int(pairs * 2),
+        mode="discrete_qw",
+    )
+    return materials, thicknesses, meta
+
+
+# =========================
+# 5) batch 打包：pad 到 batch 内最大层数
+# =========================
+def pack_batch_to_tmm_inputs(
+    batch_mats: List[List[str]],
+    batch_thks_nm: List[List[int]],
+    nk_dict_torch: Dict[str, torch.Tensor],
+    wl_m: torch.Tensor,  # [num_wl]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    返回:
+      n: [B, Lmax+2, num_wl] complex
+      d: [B, Lmax+2] real (meters, with inf at ends)
+    """
+    B = len(batch_mats)
+    num_wl = wl_m.shape[0]
+    Lmax = max(len(x) for x in batch_mats)
+
+    d = torch.zeros((B, Lmax + 2), dtype=REAL_DTYPE, device=DEVICE)
+    d[:, 0] = float("inf")
+    d[:, -1] = float("inf")
+
+    n = torch.empty((B, Lmax + 2, num_wl), dtype=COMPLEX_DTYPE, device=DEVICE)
+    n[:, 0, :] = (1.0 + 0.0j)
+    n[:, -1, :] = (1.0 + 0.0j)
+
+    for bi in range(B):
+        mats = batch_mats[bi]
+        thks = batch_thks_nm[bi]
+        L = len(mats)
+
+        d[bi, 1:1 + L] = torch.tensor(thks, dtype=REAL_DTYPE, device=DEVICE) * 1e-9  # nm -> m
+        for li, m in enumerate(mats, start=1):
+            n[bi, li, :] = nk_dict_torch[m]
+
+        if L < Lmax:
+            # pad 层：厚度=0；n 复制最后一层（也可以设 1.0）
+            # 注意：最后一层索引是 L（因为前面有入射介质）
+            n_pad_val = n[bi, L, :].clone()
+            n[bi, 1 + L:1 + Lmax, :] = n_pad_val
+
+    return n, d
+
+
+# =========================
+# 6) tmm_fast batch 计算（波长 + 样本向量化）
+# =========================
+def calc_RT_fast_batch(
+    batch_mats: List[List[str]],
+    batch_thks_nm: List[List[int]],
+    nk_dict_torch: Dict[str, torch.Tensor],
+    wl_m: torch.Tensor,       # [num_wl], meters
+    theta_rad: torch.Tensor,  # [A]
+    pol: str = "s",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    返回:
+      R: [B, num_wl] float32 numpy
+      T: [B, num_wl] float32 numpy
+    """
+    n, d = pack_batch_to_tmm_inputs(batch_mats, batch_thks_nm, nk_dict_torch, wl_m)
+
+    # 你的 tmm_fast 版本导出 coh_tmm（色散、多 stack、向量化）
+    out = tmm_fast.coh_tmm(pol, n, d, theta_rad, wl_m)
+
+    R = out["R"]
+    T = out["T"]
+
+    # 统一到 [B, num_wl]
+    if R.ndim == 3:
+        R = R[:, 0, :]
+        T = T[:, 0, :]
+    elif R.ndim != 2:
+        raise RuntimeError(f"Unexpected R shape: {tuple(R.shape)}")
+
+    return (
+        R.detach().to("cpu").float().numpy(),
+        T.detach().to("cpu").float().numpy(),
+    )
+
+
+# =========================
+# 7) 保存 train/dev
+# =========================
+def save_split(struct_list, spec_list, meta_list, out_dir):
+    N = len(struct_list)
+    rng = np.random.default_rng(SPLIT_SEED)
+    idx = rng.permutation(N)
+    split = int(N * TRAIN_RATIO)
+    idx_train = idx[:split]
     idx_dev = idx[split:]
 
     train_struct = [struct_list[i] for i in idx_train]
